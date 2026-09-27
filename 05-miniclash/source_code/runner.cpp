@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <memory>
 #include <pthread.h>
 #include <sched.h>
 #include <sstream>
@@ -64,16 +65,19 @@ void seed_attempt(size_t task_index, uint64_t attempt)
         seed32_2 = 0x12345678u;
 }
 
-void find_collision_local(const uint32 IV[],
+bool find_collision_local(const uint32 IV[],
                           uint32 msg1block0[], uint32 msg1block1[],
                           uint32 msg2block0[], uint32 msg2block1[])
 {
+    if (miniclash_cancelled()) return false;
     find_block0(msg1block0, IV);
+    if (miniclash_cancelled()) return false;
 
     uint32 IHV[4] = { IV[0], IV[1], IV[2], IV[3] };
     md5_compress(IHV, msg1block0);
 
     find_block1(msg1block1, IHV);
+    if (miniclash_cancelled()) return false;
 
     for (int t = 0; t < 16; ++t) {
         msg2block0[t] = msg1block0[t];
@@ -87,6 +91,8 @@ void find_collision_local(const uint32 IV[],
     msg2block1[4] += 1u << 31;
     msg2block1[11] -= 1u << 15;
     msg2block1[14] += 1u << 31;
+
+    return true;
 }
 
 bool prepare_task(Task& task, std::string& error)
@@ -254,6 +260,10 @@ int main(int argc, char** argv)
     if (tasks.empty())
         return 0;
 
+    std::unique_ptr<std::atomic<bool>[]> done_flags(new std::atomic<bool>[tasks.size()]);
+    for (size_t i = 0; i < tasks.size(); ++i)
+        done_flags[i].store(false, std::memory_order_relaxed);
+
     // Prefix parsing and IHV derivation are deterministic and tiny compared to
     // collision search. Do them exactly once per task so hedged attempts share
     // the result instead of re-reading/re-hashing the same prefix.
@@ -334,9 +344,23 @@ int main(int argc, char** argv)
 
             uint32 msg1block0[16], msg1block1[16];
             uint32 msg2block0[16], msg2block1[16];
-            find_collision_local(tasks[task_index].iv.data(),
-                                 msg1block0, msg1block1,
-                                 msg2block0, msg2block1);
+            miniclash_cancel_flag = &done_flags[task_index];
+            const bool search_completed =
+                find_collision_local(tasks[task_index].iv.data(),
+                                     msg1block0, msg1block1,
+                                     msg2block0, msg2block1);
+            miniclash_cancel_flag = nullptr;
+
+            if (!search_completed) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    Task& t = tasks[task_index];
+                    if (t.running != 0)
+                        --t.running;
+                }
+                cv.notify_all();
+                continue;
+            }
 
             bool winner = false;
             {
@@ -346,6 +370,7 @@ int main(int argc, char** argv)
                     --t.running;
                 if (t.state == 0) {
                     t.state = 1;
+                    done_flags[task_index].store(true, std::memory_order_relaxed);
                     winner = true;
                 }
             }
@@ -364,6 +389,8 @@ int main(int argc, char** argv)
                     std::lock_guard<std::mutex> lock(mutex);
                     failed = true;
                     failure_message = error;
+                    for (size_t i = 0; i < tasks.size(); ++i)
+                        done_flags[i].store(true, std::memory_order_relaxed);
                 }
                 cv.notify_all();
                 return;
