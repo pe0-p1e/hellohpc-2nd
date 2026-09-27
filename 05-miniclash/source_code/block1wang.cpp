@@ -2,27 +2,38 @@
 #include <vector>
 #include "main.hpp"
 
+namespace {
+const std::vector<uint32> q4mask = [] {
+	std::vector<uint32> v(1<<6);
+	for (unsigned k = 0; k < v.size(); ++k)
+		v[k] = ((k<<13) ^ (k<<19)) & 0x01c0e000;
+	return v;
+}();
+
+struct WangQMasks {
+	std::vector<uint32> q9, q10;
+	WangQMasks(): q9(1<<5), q10(1<<5) {
+		for (unsigned k = 0; k < q9.size(); ++k) {
+			uint32 msk = (k<<5) ^ (k<<13) ^ (k<<17) ^ (k<<24);
+			q9[k] = msk & 0x00084000;
+			q10[k] = msk & 0x18000020;
+		}
+	}
+};
+const WangQMasks wang_q_masks;
+
+const std::vector<uint32> q9mask2 = [] {
+	std::vector<uint32> v(1<<10);
+	for (unsigned k = 0; k < v.size(); ++k)
+		v[k] = ((k<<1) ^ (k<<7) ^ (k<<14) ^ (k<<15) ^ (k<<22)) & 0x6074041c;
+	return v;
+}();
+}
+
 void find_block1_wang(uint32 block[], const uint32 IV[])
 {
 	uint32 Q[68] = { IV[0], IV[3], IV[2], IV[1] };
 
-	std::vector<uint32> q4mask(1<<6);
-	for (unsigned k = 0; k < q4mask.size(); ++k)
-		q4mask[k] = ((k<<13) ^ (k<<19)) & 0x01c0e000;
-
-	std::vector<uint32> q9mask(1<<5), q10mask(1<<5);
-	for (unsigned k = 0; k < q9mask.size(); ++k)
-	{
-		uint32 msk = (k<<5) ^ (k<<13) ^ (k<<17) ^ (k<<24);
-		q9mask[k] = msk &  0x00084000;
-		q10mask[k] = msk & 0x18000020;
-	}
-	
-	std::vector<uint32> q9mask2(1<<10);
-	for (unsigned k = 0; k < q9mask2.size(); ++k)
-		q9mask2[k] = ((k<<1) ^ (k<<7) ^ (k<<14) ^ (k<<15) ^ (k<<22)) & 0x6074041c;
-	
-	
 	while (true) 
 	{
 		uint32 aa = Q[Qoff] & 0x80000000;
@@ -134,9 +145,9 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 			unsigned counter2 = 0;
 			while (counter2 < (1<<5))
 			{
-				uint32 q10 = q10b ^ q10mask[counter2];
+				uint32 q10 = q10b ^ wang_q_masks.q10[counter2];
 				uint32 m10 = RR(Q[Qoff+11]-q10,17);
-				uint32 q9 = q9b ^ q9mask[counter2];
+				uint32 q9 = q9b ^ wang_q_masks.q9[counter2];
 				++counter2;
 
 				m10 -= FF(q10, q9, Q[Qoff+8]) + tt10;
