@@ -46,7 +46,6 @@ namespace {
 struct BHFastPoint {
   Block *b;
   int det, th, ph;
-  double avgw;
   double x[3];
   int inds[3];
   double coef[6 * ghost_width];
@@ -333,25 +332,13 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   int world=1;MPI_Comm_size(MPI_COMM_WORLD,&world);
   c.pts.clear();c.pts.reserve(((size_t)ntot*c.ndet+world-1)/world*2+64);
   for(int d=0;d<c.ndet;++d){double r=c.radii[d];
-    for(int n=0;n<ntot;++n){
-      double x[3]={r*nx[n],r*ny[n],r*nz[n]};
-      int owners=0;
-      for(size_t k=0;k<bs.size();++k)
-        if(bh_owns(bs[k],x,h)) ++owners;
-      if(owners==0) return false;
-      const double avgw=1.0/owners;
-
-      for(size_t k=0;k<bs.size();++k) {
-        if(!bh_owns(bs[k],x,h)) continue;
-        Block *own=bs[k].b;
-        if(own->rank!=rank) continue;
-
-        BHFastPoint p;
-        p.b=own; p.det=d; p.th=n/nph; p.ph=n-p.th*nph; p.avgw=avgw;
-        p.x[0]=x[0];p.x[1]=x[1];p.x[2]=x[2];
-        if(!bh_prepare_interp(p,own,x,c.ord,sym)) return false;
-        c.pts.push_back(p);
-      }
+    for(int n=0;n<ntot;++n){double x[3]={r*nx[n],r*ny[n],r*nz[n]};Block *own=NULL;
+      for(size_t k=0;k<bs.size();++k)if(bh_owns(bs[k],x,h)){own=bs[k].b;break;}
+      if(!own)return false;if(own->rank!=rank)continue;
+      BHFastPoint p;p.b=own;p.det=d;p.th=n/nph;p.ph=n-p.th*nph;
+      p.x[0]=x[0];p.x[1]=x[1];p.x[2]=x[2];
+      if(!bh_prepare_interp(p,own,x,c.ord,sym)) return false;
+      c.pts.push_back(p);
     }}
   c.fourier.assign((size_t)c.ndet*nth*c.nm*4,0.0);
   c.local.assign((size_t)c.ndet*c.modes*2,0.0);
@@ -427,7 +414,7 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
         for(int iy=0; iy<c.ord; ++iy) {
           const double wyz=wy[iy]*wz[iz];
           for(int ix=0; ix<c.ord; ++ix) {
-            const double wR=p.avgw*wx[ix]*wyz;
+            const double wR=wx[ix]*wyz;
             const double wI=wR*izsgn;
             const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
             const int id=imap[at];
@@ -483,7 +470,7 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
           for(int iy=0; iy<c.ord; ++iy) {
             const double wyz=wy[iy]*wz[iz];
             for(int ix=0; ix<c.ord; ++ix) {
-              const double ww=p.avgw*wx[ix]*wyz;
+              const double ww=wx[ix]*wyz;
               const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
               BHFourierKey key={p.b,at,p.th};
               int id;
