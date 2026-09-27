@@ -26,7 +26,7 @@ int main()
 	uint32 msg1block1[16];
 	uint32 msg2block0[16];
 	uint32 msg2block1[16];
-	find_collision(IV, msg1block0, msg1block1, msg2block0, msg2block1, true);
+	find_collision(IV, msg1block0, msg1block1, msg2block0, msg2block1, verbose);
 
 	ofstream ofs1("msg1", ios::binary);
 	save_block(ofs1, msg1block0);
@@ -340,19 +340,6 @@ int main(int argc, char** argv)
 
 		if (verbose)
 			cout << "Using output filenames: '" << outfn1 << "' and '" << outfn2 << "'" << endl;
-		ofstream ofs1(outfn1.c_str(), ios::binary);
-		if (!ofs1)
-		{
-			cerr << "Error: cannot open outfile: '" << outfn1 << "'" << endl;
-			return 1;
-		}
-		ofstream ofs2(outfn2.c_str(), ios::binary);
-		if (!ofs2)
-		{
-			cerr << "Error: cannot open outfile: '" << outfn2 << "'" << endl;
-			return 1;
-		}
-
 		if (opt.has_prefixfile)
 		{
 			if (verbose)
@@ -369,8 +356,6 @@ int main(int argc, char** argv)
 				unsigned len = load_block(ifs, block);
 				if (len)
 				{
-					save_block(ofs1, block);
-					save_block(ofs2, block);
 					md5_compress(IV, block);
 				} else
 					break;
@@ -428,7 +413,39 @@ int main(int argc, char** argv)
 		uint32 msg1block1[16];
 		uint32 msg2block0[16];
 		uint32 msg2block1[16];
-		find_collision(IV, msg1block0, msg1block1, msg2block0, msg2block1, true);
+		find_collision(IV, msg1block0, msg1block1, msg2block0, msg2block1, verbose);
+
+		// Defer all output creation until a collision has actually been found.
+		// Hedged searches that lose the race are normally terminated here, so
+		// they no longer create and rewrite temporary prefix files.
+		ofstream ofs1(outfn1.c_str(), ios::binary);
+		if (!ofs1)
+		{
+			cerr << "Error: cannot open outfile: '" << outfn1 << "'" << endl;
+			return 1;
+		}
+		ofstream ofs2(outfn2.c_str(), ios::binary);
+		if (!ofs2)
+		{
+			cerr << "Error: cannot open outfile: '" << outfn2 << "'" << endl;
+			return 1;
+		}
+
+		if (opt.has_prefixfile)
+		{
+			ifstream ifs(prefixfn.c_str(), ios::binary);
+			if (!ifs)
+			{
+				cerr << "Error: cannot reopen inputfile: '" << prefixfn << "'" << endl;
+				return 1;
+			}
+			uint32 block[16];
+			while (load_block(ifs, block))
+			{
+				save_block(ofs1, block);
+				save_block(ofs2, block);
+			}
+		}
 
 		save_block(ofs1, msg1block0);
 		save_block(ofs1, msg1block1);
