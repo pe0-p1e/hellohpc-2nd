@@ -1,2 +1,7 @@
 #!/usr/bin/env bash
-exec python3 "$(dirname "$0")/run.py" "$@"
+set -e
+if [ "$#" -ne 1 ]; then
+    echo "usage: $0 <tasks.txt>" >&2
+    exit 2
+fi
+exec "$(dirname "$0")/md5fastcoll" --batch "$1"
