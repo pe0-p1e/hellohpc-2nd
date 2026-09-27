@@ -86,8 +86,9 @@ struct BHFourierOp {
 };
 
 struct BHFastCache {
-  bool configured, ready, valid, use_fullop;
-  int lev, maxl, modes, ndet, ord, nth, nph, nm;
+  bool configured, ready, valid, use_fullop, use_rankorder;
+  int lev, maxl, modes, ndet, ord, nth, nph, nm, ntot;
+  int world, rank, rank_nmin, rank_nmax, rank_nlocal;
   double rmax, dr;
   cgh *gh;
   std::vector<double> radii, cphi, sphi, thetaA, thetaB;
@@ -95,9 +96,15 @@ struct BHFastCache {
   std::vector<BHFastPoint> pts;
   std::vector<BHFullDet> fullop;
   std::vector<BHFourierOp> fop;
+  std::vector<int> send_point_idx;
+  std::vector<int> sendcounts_p, sdispls_p, recvcounts_p, rdispls_p;
+  std::vector<int> sendcounts_d, sdispls_d, recvcounts_d, rdispls_d;
+  std::vector<int> recv_slot;
+  std::vector<double> sendbuf, recvbuf, rank_shell;
   std::vector<double> fourier, local, global;
-  BHFastCache():configured(false),ready(false),valid(false),use_fullop(false),lev(-1),maxl(0),
-    modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
+  BHFastCache():configured(false),ready(false),valid(false),use_fullop(false),use_rankorder(false),
+    lev(-1),maxl(0),modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),ntot(0),
+    world(1),rank(0),rank_nmin(0),rank_nmax(-1),rank_nlocal(0),rmax(0),dr(0),gh(NULL){}
 };
 static std::map<const surface_integral*,BHFastCache> bhfc;
 
@@ -284,6 +291,99 @@ static size_t bh_fidx(const BHFastCache &c,int d,int t,int m,int z) {
   return ((((size_t)d*c.nth+t)*c.nm+m)*4+z);
 }
 
+static inline void bh_rank_range(int ntot,int world,int rank,int &nmin,int &nmax) {
+  const int mp=ntot/world;
+  const int lp=ntot-world*mp;
+  if(lp>rank) {
+    nmin=rank*mp+rank;
+    nmax=nmin+mp;
+  } else {
+    nmin=rank*mp+lp;
+    nmax=nmin+mp-1;
+  }
+}
+
+static inline int bh_rank_owner(int n,int ntot,int world) {
+  const int mp=ntot/world;
+  const int lp=ntot-world*mp;
+  const int cut=lp*(mp+1);
+  if(n<cut) return n/(mp+1);
+  return lp+(n-cut)/mp;
+}
+
+static bool bh_build_rankorder_plan(BHFastCache &c) {
+  c.sendcounts_p.assign(c.world,0);
+  c.recvcounts_p.assign(c.world,0);
+  c.sdispls_p.assign(c.world,0);
+  c.rdispls_p.assign(c.world,0);
+
+  for(size_t i=0;i<c.pts.size();++i) {
+    const BHFastPoint &p=c.pts[i];
+    const int n=p.th*c.nph+p.ph;
+    const int dst=bh_rank_owner(n,c.ntot,c.world);
+    if(dst<0 || dst>=c.world) return false;
+    c.sendcounts_p[dst]++;
+  }
+
+  MPI_Alltoall(c.sendcounts_p.data(),1,MPI_INT,
+               c.recvcounts_p.data(),1,MPI_INT,MPI_COMM_WORLD);
+
+  int stot=0,rtot=0;
+  for(int r=0;r<c.world;++r) {
+    c.sdispls_p[r]=stot; stot+=c.sendcounts_p[r];
+    c.rdispls_p[r]=rtot; rtot+=c.recvcounts_p[r];
+  }
+
+  c.send_point_idx.assign(stot,-1);
+  std::vector<int> sendkeys(stot,-1), cursor=c.sdispls_p;
+  for(size_t i=0;i<c.pts.size();++i) {
+    const BHFastPoint &p=c.pts[i];
+    const int n=p.th*c.nph+p.ph;
+    const int dst=bh_rank_owner(n,c.ntot,c.world);
+    const int pos=cursor[dst]++;
+    c.send_point_idx[pos]=(int)i;
+    sendkeys[pos]=p.det*c.ntot+n;
+  }
+
+  std::vector<int> recvkeys(rtot,-1);
+  MPI_Alltoallv(sendkeys.data(),c.sendcounts_p.data(),c.sdispls_p.data(),MPI_INT,
+                recvkeys.data(),c.recvcounts_p.data(),c.rdispls_p.data(),MPI_INT,
+                MPI_COMM_WORLD);
+
+  bh_rank_range(c.ntot,c.world,c.rank,c.rank_nmin,c.rank_nmax);
+  c.rank_nlocal=(c.rank_nmax>=c.rank_nmin)?(c.rank_nmax-c.rank_nmin+1):0;
+
+  c.recv_slot.assign(rtot,-1);
+  std::vector<unsigned char> seen((size_t)c.ndet*c.rank_nlocal,0);
+  for(int k=0;k<rtot;++k) {
+    const int key=recvkeys[k];
+    const int d=key/c.ntot;
+    const int n=key-d*c.ntot;
+    if(d<0 || d>=c.ndet || n<c.rank_nmin || n>c.rank_nmax) return false;
+    const int slot=d*c.rank_nlocal+(n-c.rank_nmin);
+    if(seen[slot]) return false;
+    seen[slot]=1;
+    c.recv_slot[k]=slot;
+  }
+  for(size_t i=0;i<seen.size();++i) if(!seen[i]) return false;
+
+  c.sendcounts_d.resize(c.world);
+  c.recvcounts_d.resize(c.world);
+  c.sdispls_d.resize(c.world);
+  c.rdispls_d.resize(c.world);
+  for(int r=0;r<c.world;++r) {
+    c.sendcounts_d[r]=2*c.sendcounts_p[r];
+    c.recvcounts_d[r]=2*c.recvcounts_p[r];
+    c.sdispls_d[r]=2*c.sdispls_p[r];
+    c.rdispls_d[r]=2*c.rdispls_p[r];
+  }
+
+  c.sendbuf.assign((size_t)2*stot,0.0);
+  c.recvbuf.assign((size_t)2*rtot,0.0);
+  c.rank_shell.assign((size_t)c.ndet*c.rank_nlocal*2,0.0);
+  return true;
+}
+
 static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
                      int sym,int nth,int nph,int ntot,double *nx,double *ny,double *nz,
                      double *ct,double *qw,double dphi,int rank) {
@@ -299,7 +399,9 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   if(sym!=1||!gh||lev<0||lev>=gh->levels||gh->grids[lev]!=1||
      c.ord<2||c.ord>2*ghost_width||(c.ord&1)||c.maxl<2||c.ndet<1) return false;
   Patch *pa=gh->PatL[lev]?gh->PatL[lev]->data:NULL; if(!pa) return false;
-  c.lev=lev;c.gh=gh;c.nth=nth;c.nph=nph;
+  c.lev=lev;c.gh=gh;c.nth=nth;c.nph=nph;c.ntot=ntot;
+  MPI_Comm_size(MPI_COMM_WORLD,&c.world);
+  MPI_Comm_rank(MPI_COMM_WORLD,&c.rank);
   c.ml.clear();c.mm.clear();
   for(int l=2;l<=c.maxl;++l) for(int m=-l;m<=l;++m){c.ml.push_back(l);c.mm.push_back(m);}
   c.cphi.resize((size_t)nph*c.nm); c.sphi.resize((size_t)nph*c.nm);
@@ -348,6 +450,7 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   // footprint grows linearly with the number of spherical-harmonic modes.
   // Select by a generic problem-size property, never by case name/config seed.
   c.use_fullop = (c.modes <= 32);
+  c.use_rankorder = !c.use_fullop;
   c.fullop.clear();
 
   if(c.use_fullop) {
@@ -447,116 +550,12 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
     c.fourier.clear();
     c.fourier.shrink_to_fit();
   } else {
-    // High-mode path: eliminate timed interpolation while keeping memory
-    // proportional to nm rather than the full number of (l,m) modes.
+    // Numerically stable high-mode path: preserve legacy contiguous-n ownership
+    // while communicating only the two interpolated values for each surface point.
     c.fop.clear();
-    c.fop.resize(c.ndet);
-
-    for(int d=0; d<c.ndet; ++d) {
-      std::unordered_map<BHFourierKey,int,BHFourierKeyHash> ids;
-      BHFourierOp &op=c.fop[d];
-      ids.reserve(c.pts.size()/c.ndet*c.ord+64);
-
-      for(size_t pp=0; pp<c.pts.size(); ++pp) {
-        const BHFastPoint &p=c.pts[pp];
-        if(p.det!=d) continue;
-        const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
-        const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
-        const size_t tr=(size_t)p.ph*c.nm;
-
-        for(int iz=0; iz<c.ord; ++iz) {
-          const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
-          const double idelta=izsgn-1.0;
-          for(int iy=0; iy<c.ord; ++iy) {
-            const double wyz=wy[iy]*wz[iz];
-            for(int ix=0; ix<c.ord; ++ix) {
-              const double ww=wx[ix]*wyz;
-              const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
-              BHFourierKey key={p.b,at,p.th};
-              int id;
-              std::unordered_map<BHFourierKey,int,BHFourierKeyHash>::iterator it=ids.find(key);
-              if(it==ids.end()) {
-                id=(int)op.th.size();
-                ids.insert(std::make_pair(key,id));
-                op.raddr.push_back(p.b->fgfs[rp->sgfn]+at);
-                op.iaddr.push_back(p.b->fgfs[ip->sgfn]+at);
-                op.th.push_back((unsigned short)p.th);
-                op.corr.push_back(-1);
-                op.wc.resize(op.wc.size()+(size_t)c.nm,0.0);
-                op.ws.resize(op.ws.size()+(size_t)c.nm,0.0);
-              } else id=it->second;
-
-              double *dc=&op.wc[(size_t)id*c.nm];
-              double *ds=&op.ws[(size_t)id*c.nm];
-              for(int m=0;m<c.nm;++m) {
-                dc[m] += ww*c.cphi[tr+m];
-                ds[m] += ww*c.sphi[tr+m];
-              }
-
-              if(idelta!=0.0) {
-                if(op.corr[id]<0) {
-                  op.corr[id]=(int)(op.cwc.size()/c.nm);
-                  op.cwc.resize(op.cwc.size()+(size_t)c.nm,0.0);
-                  op.cws.resize(op.cws.size()+(size_t)c.nm,0.0);
-                }
-                double *cdc=&op.cwc[(size_t)op.corr[id]*c.nm];
-                double *cds=&op.cws[(size_t)op.corr[id]*c.nm];
-                const double dw=ww*idelta;
-                for(int m=0;m<c.nm;++m) {
-                  cdc[m] += dw*c.cphi[tr+m];
-                  cds[m] += dw*c.sphi[tr+m];
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // Group sparse rows by theta so the timed path can keep all |m|
-      // Fourier accumulators local until the group is complete.
-      const size_t nr=op.th.size();
-      std::vector<size_t> order(nr);
-      for(size_t i=0;i<nr;++i) order[i]=i;
-      std::stable_sort(order.begin(),order.end(),
-        [&op](size_t a,size_t b){ return op.th[a] < op.th[b]; });
-
-      std::vector<const double*> nraddr(nr), niaddr(nr);
-      std::vector<unsigned short> nthv(nr);
-      std::vector<int> ncorr(nr);
-      std::vector<double> nwc(nr*(size_t)c.nm), nws(nr*(size_t)c.nm);
-      for(size_t dst=0;dst<nr;++dst) {
-        const size_t src=order[dst];
-        nraddr[dst]=op.raddr[src];
-        niaddr[dst]=op.iaddr[src];
-        nthv[dst]=op.th[src];
-        ncorr[dst]=op.corr[src];
-        std::copy(&op.wc[src*(size_t)c.nm],
-                  &op.wc[(src+1)*(size_t)c.nm],
-                  &nwc[dst*(size_t)c.nm]);
-        std::copy(&op.ws[src*(size_t)c.nm],
-                  &op.ws[(src+1)*(size_t)c.nm],
-                  &nws[dst*(size_t)c.nm]);
-      }
-      op.raddr.swap(nraddr);
-      op.iaddr.swap(niaddr);
-      op.th.swap(nthv);
-      op.corr.swap(ncorr);
-      op.wc.swap(nwc);
-      op.ws.swap(nws);
-
-      op.theta_begin.assign((size_t)c.nth+1,nr);
-      size_t pos=0;
-      for(int t=0;t<c.nth;++t) {
-        op.theta_begin[t]=pos;
-        while(pos<nr && (int)op.th[pos]==t) ++pos;
-      }
-      op.theta_begin[c.nth]=nr;
-    }
-
-    c.pts.clear();
-    c.pts.shrink_to_fit();
     c.fourier.clear();
     c.fourier.shrink_to_fit();
+    if(!bh_build_rankorder_plan(c)) return false;
   }
   c.valid=true;return true;
 }
@@ -733,47 +732,76 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
       }
     }
   } else {
+    // 1) Evaluate exact interpolation on the grid-owner ranks and pack by
+    //    legacy integration owner (contiguous global n interval).
+    for(size_t k=0;k<c.send_point_idx.size();++k) {
+      const BHFastPoint &p=c.pts[c.send_point_idx[k]];
+      double rr=0.0,ii=0.0;
+      bh_interp_pair(p,c.ord,
+                     p.b->fgfs[rp->sgfn],p.b->fgfs[ip->sgfn],
+                     ip->SoA[2],rr,ii);
+      c.sendbuf[2*k]=rr;
+      c.sendbuf[2*k+1]=ii;
+    }
+
+    MPI_Alltoallv(c.sendbuf.data(),c.sendcounts_d.data(),c.sdispls_d.data(),MPI_DOUBLE,
+                  c.recvbuf.data(),c.recvcounts_d.data(),c.rdispls_d.data(),MPI_DOUBLE,
+                  MPI_COMM_WORLD);
+
+    for(size_t k=0;k<c.recv_slot.size();++k) {
+      const size_t off=(size_t)c.recv_slot[k]*2;
+      c.rank_shell[off]=c.recvbuf[2*k];
+      c.rank_shell[off+1]=c.recvbuf[2*k+1];
+    }
+
+    // 2) Reproduce the legacy rank decomposition.  Within each rank, factor
+    //    only the phi sum; the global n ordering seen by every mode is kept.
     std::fill(c.local.begin(),c.local.end(),0.0);
 
     for(int d=0;d<c.ndet;++d) {
       double *outR=&c.local[(size_t)d*c.modes*2];
       double *outI=outR+c.modes;
-#ifdef __AVX512F__
-      if(c.nm==8) bh_fourier_project8_avx512(c,d,outR,outI);
-      else
-#endif
-      if(c.nm==8) bh_fourier_project_grouped<8>(c,d,outR,outI);
-      else if(c.nm==10) bh_fourier_project_grouped<10>(c,d,outR,outI);
-      else {
-        // Generic high-mode fallback (not used by current benchmark configs).
-        const BHFourierOp &op=c.fop[d];
-        const double radius=c.radii[d];
-        for(int t=0;t<c.nth;++t) {
-          const size_t beg=op.theta_begin[t],end=op.theta_begin[t+1];
-          std::vector<double> rc(c.nm,0.0),rs(c.nm,0.0),ic(c.nm,0.0),is(c.nm,0.0);
-          for(size_t j=beg;j<end;++j) {
-            const double rv=*op.raddr[j],iv=*op.iaddr[j];
-            const double *wc=&op.wc[j*(size_t)c.nm],*ws=&op.ws[j*(size_t)c.nm];
-            for(int m=0;m<c.nm;++m) {
-              rc[m]+=wc[m]*rv; rs[m]+=ws[m]*rv;
-              ic[m]+=wc[m]*iv; is[m]+=ws[m]*iv;
-            }
-            if(op.corr[j]>=0) {
-              const double *cc=&op.cwc[(size_t)op.corr[j]*c.nm];
-              const double *cs=&op.cws[(size_t)op.corr[j]*c.nm];
-              for(int m=0;m<c.nm;++m){ic[m]+=cc[m]*iv;is[m]+=cs[m]*iv;}
-            }
+      const double radius=c.radii[d];
+      const size_t shellbase=(size_t)d*c.rank_nlocal*2;
+
+      for(int t=0;t<c.nth;++t) {
+        const int row0=t*c.nph;
+        const int row1=row0+c.nph-1;
+        const int lo=std::max(c.rank_nmin,row0);
+        const int hi=std::min(c.rank_nmax,row1);
+        if(lo>hi) continue;
+
+        double rc[16]={0},rs[16]={0},ic[16]={0},is[16]={0};
+        for(int n=lo;n<=hi;++n) {
+          const int ln=n-c.rank_nmin;
+          const int ph=n-row0;
+          const double rv=c.rank_shell[shellbase+(size_t)2*ln];
+          const double iv=c.rank_shell[shellbase+(size_t)2*ln+1];
+          const size_t tr=(size_t)ph*c.nm;
+          for(int m=0;m<c.nm;++m) {
+            const double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
+            rc[m]+=rv*cs; rs[m]+=rv*sn;
+            ic[m]+=iv*cs; is[m]+=iv*sn;
           }
-          for(int q=0;q<c.modes;++q) {
-            const int m=c.mm[q],ma=abs(m); const double ss=m<0?-1.0:1.0;
-            const double A=c.thetaA[(size_t)q*c.nth+t],B=c.thetaB[(size_t)q*c.nth+t];
-            outR[q]+=radius*(A*rc[ma]+B*(ss*is[ma]));
-            outI[q]+=radius*(B*ic[ma]-A*(ss*rs[ma]));
-          }
+        }
+
+        for(int q=0;q<c.modes;++q) {
+          const int m=c.mm[q],ma=abs(m);
+          const double ss=m<0?-1.0:1.0;
+          const double A=c.thetaA[(size_t)q*c.nth+t];
+          const double B=c.thetaB[(size_t)q*c.nth+t];
+          outR[q]+=radius*(A*rc[ma]+B*(ss*is[ma]));
+          outI[q]+=radius*(B*ic[ma]-A*(ss*rs[ma]));
         }
       }
     }
+
+    MPI_Allreduce(c.local.data(),c.global.data(),(int)c.local.size(),
+                  MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+    c.ready=true;
+    return;
   }
+
 
 
 
