@@ -160,26 +160,28 @@ static bool bh_prepare_interp(BHFastPoint &p,Block *b,const double x[3],
   return true;
 }
 
-static inline void bh_interp_pair(const BHFastPoint &p,int ord,
-                                  const double *R,const double *I,
-                                  double iz_parity,double &rr,double &ii) {
+template<int ORD>
+static inline void bh_interp_pair_fixed(const BHFastPoint &p,
+                                        const double *__restrict R,
+                                        const double *__restrict I,
+                                        double iz_parity,
+                                        double &rr,double &ii) {
   const int nx=p.b->shape[0];
   const int nxy=nx*p.b->shape[1];
-  double zyR[2*ghost_width][2*ghost_width];
-  double zyI[2*ghost_width][2*ghost_width];
-  double yR[2*ghost_width], yI[2*ghost_width];
+  double zyR[ORD][ORD];
+  double zyI[ORD][ORD];
+  double yR[ORD], yI[ORD];
 
-  const double *wz=&p.coef[2*ord];
-  const double *wy=&p.coef[ord];
+  const double *wz=&p.coef[2*ORD];
+  const double *wy=&p.coef[ORD];
   const double *wx=&p.coef[0];
 
-  // Same contraction order as Fortran global_interpind: z -> y -> x.
-  for(int ix=0;ix<ord;++ix) {
+  for(int ix=0;ix<ORD;++ix) {
     const int bx=p.pix[ix];
-    for(int iy=0;iy<ord;++iy) {
+    for(int iy=0;iy<ORD;++iy) {
       const int bxy=bx+p.piy[iy]*nx;
       double sr=0.0,si=0.0;
-      for(int iz=0;iz<ord;++iz) {
+      for(int iz=0;iz<ORD;++iz) {
         const int at=bxy+p.piz[iz]*nxy;
         const double w=wz[iz];
         sr += w*R[at];
@@ -189,18 +191,55 @@ static inline void bh_interp_pair(const BHFastPoint &p,int ord,
       zyI[ix][iy]=si;
     }
   }
-  for(int ix=0;ix<ord;++ix) {
+  for(int ix=0;ix<ORD;++ix) {
     double sr=0.0,si=0.0;
-    for(int iy=0;iy<ord;++iy) {
+    for(int iy=0;iy<ORD;++iy) {
       sr += wy[iy]*zyR[ix][iy];
       si += wy[iy]*zyI[ix][iy];
     }
     yR[ix]=sr; yI[ix]=si;
   }
   rr=0.0; ii=0.0;
-  for(int ix=0;ix<ord;++ix) {
+  for(int ix=0;ix<ORD;++ix) {
     rr += wx[ix]*yR[ix];
     ii += wx[ix]*yI[ix];
+  }
+}
+
+static inline void bh_interp_pair(const BHFastPoint &p,int ord,
+                                  const double *__restrict R,
+                                  const double *__restrict I,
+                                  double iz_parity,double &rr,double &ii) {
+  if(ord==6) {
+    bh_interp_pair_fixed<6>(p,R,I,iz_parity,rr,ii);
+  } else if(ord==4) {
+    bh_interp_pair_fixed<4>(p,R,I,iz_parity,rr,ii);
+  } else {
+    // Supported configs are 4/6; keep a conservative fallback for generic even orders.
+    const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+    double zyR[2*ghost_width][2*ghost_width],zyI[2*ghost_width][2*ghost_width];
+    double yR[2*ghost_width],yI[2*ghost_width];
+    const double *wz=&p.coef[2*ord],*wy=&p.coef[ord],*wx=&p.coef[0];
+    for(int ix=0;ix<ord;++ix) {
+      for(int iy=0;iy<ord;++iy) {
+        double sr=0.0,si=0.0;
+        const int bxy=p.pix[ix]+p.piy[iy]*nx;
+        for(int iz=0;iz<ord;++iz) {
+          const int at=bxy+p.piz[iz]*nxy;
+          const double w=wz[iz];
+          sr+=w*R[at];
+          si+=w*(p.zref[iz]?iz_parity:1.0)*I[at];
+        }
+        zyR[ix][iy]=sr; zyI[ix][iy]=si;
+      }
+    }
+    for(int ix=0;ix<ord;++ix) {
+      double sr=0.0,si=0.0;
+      for(int iy=0;iy<ord;++iy){sr+=wy[iy]*zyR[ix][iy];si+=wy[iy]*zyI[ix][iy];}
+      yR[ix]=sr;yI[ix]=si;
+    }
+    rr=0.0;ii=0.0;
+    for(int ix=0;ix<ord;++ix){rr+=wx[ix]*yR[ix];ii+=wx[ix]*yI[ix];}
   }
 }
 
@@ -468,37 +507,7 @@ void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *I
                      NULL,
 #endif
                      dphi,myrank);
-  if(c.valid) {
-    bh_eval(c,Rpsi4,Ipsi4);
-    if(field_generation==1) {
-      std::vector<double> fast=c.global;
-      std::vector<double> rr(c.modes),ii(c.modes);
-      double max_abs=0.0,max_rel=0.0; int bad_det=-1,bad_mode=-1,bad_part=-1;
-      c.ready=false;
-      for(int d=0; d<c.ndet; ++d) {
-        surf_Wave(c.radii[d],lev,GH,Rpsi4,Ipsi4,2,c.maxl,c.modes,
-                  rr.data(),ii.data(),NULL);
-        if(myrank==0) {
-          const double *q=&fast[(size_t)d*c.modes*2];
-          for(int m=0;m<c.modes;++m) {
-            double vals[2]={rr[m],ii[m]};
-            double refs[2]={q[m],q[c.modes+m]};
-            for(int part=0;part<2;++part) {
-              double da=fabs(vals[part]-refs[part]);
-              double dr=da/std::max(1.0e-300,fabs(vals[part]));
-              if(da>max_abs){max_abs=da;bad_det=d;bad_mode=m;bad_part=part;}
-              if(dr>max_rel)max_rel=dr;
-            }
-          }
-        }
-      }
-      if(myrank==0)
-        cerr<<"BH_DEBUG fast-vs-legacy max_abs="<<setprecision(17)<<max_abs
-            <<" max_rel="<<max_rel<<" det="<<bad_det<<" mode="<<bad_mode
-            <<" part="<<(bad_part==0?"R":"I")<<endl;
-      c.ready=true;
-    }
-  }
+  if(c.valid) bh_eval(c,Rpsi4,Ipsi4);
 }
 void surface_integral::end_wave_benchmark()
 {
