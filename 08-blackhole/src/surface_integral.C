@@ -495,7 +495,6 @@ surface_integral::~surface_integral()
 void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
                                             int field_generation)
 {
-  (void)field_generation;
   BHFastCache &c=bhfc[this];
   c.ready=false;
   if(!c.valid || c.gh!=GH || c.lev!=lev)
@@ -507,6 +506,37 @@ void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *I
                      NULL,
 #endif
                      dphi,myrank);
+
+  if(c.valid && field_generation==1) {
+    double local_max_r=0.0,local_max_i=0.0;
+    double worst[8]={0,0,0,0,0,0,0,0};
+    for(size_t z=0;z<c.pts.size();++z) {
+      BHFastPoint &p=c.pts[z];
+      double fr=0.0,fi=0.0,lr=0.0,li=0.0;
+      bh_interp_pair(p,c.ord,
+                     p.b->fgfs[Rpsi4->sgfn],p.b->fgfs[Ipsi4->sgfn],
+                     Ipsi4->SoA[2],fr,fi);
+      double xx=p.x[0],yy=p.x[1],zz=p.x[2];
+      int ord=c.ord, sym=Symmetry;
+      f_global_interp(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
+                      p.b->fgfs[Rpsi4->sgfn],lr,xx,yy,zz,ord,Rpsi4->SoA,sym);
+      f_global_interp(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
+                      p.b->fgfs[Ipsi4->sgfn],li,xx,yy,zz,ord,Ipsi4->SoA,sym);
+      const double dr=fabs(fr-lr),di=fabs(fi-li);
+      if(dr>local_max_r){local_max_r=dr;worst[0]=p.det;worst[1]=p.th;worst[2]=p.ph;worst[3]=dr;}
+      if(di>local_max_i){local_max_i=di;worst[4]=p.det;worst[5]=p.th;worst[6]=p.ph;worst[7]=di;}
+    }
+    double global_r=0.0,global_i=0.0;
+    MPI_Reduce(&local_max_r,&global_r,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    MPI_Reduce(&local_max_i,&global_i,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    if(myrank==0)
+      cout<<"BH_INTERP_DEBUG maxR="<<setprecision(17)<<global_r
+          <<" maxI="<<global_i<<endl;
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Finalize();
+    std::exit(0);
+  }
+
   if(c.valid) bh_eval(c,Rpsi4,Ipsi4);
 }
 void surface_integral::end_wave_benchmark()
