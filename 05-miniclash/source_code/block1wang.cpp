@@ -1,6 +1,47 @@
 #include <iostream>
 #include <vector>
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 #include "main.hpp"
+
+
+static inline __attribute__((always_inline)) bool finish_wang_candidate(
+    uint32 block[], const uint32 IV[], uint32 a, uint32 b, uint32 c, uint32 d)
+{
+    MD5_STEP(II, a, b, c, d, block[12], 0x655b59c3, 6);
+    if (0 != ((a^c) >> 31)) return false;
+    MD5_STEP(II, d, a, b, c, block[3], 0x8f0ccc92, 10);
+    if (0 != ((b^d) >> 31)) return false;
+    MD5_STEP(II, c, d, a, b, block[10], 0xffeff47d, 15);
+    if (0 != ((a^c) >> 31)) return false;
+    MD5_STEP(II, b, c, d, a, block[1], 0x85845dd1, 21);
+    if (0 != ((b^d) >> 31)) return false;
+    MD5_STEP(II, a, b, c, d, block[8], 0x6fa87e4f, 6);
+    if (0 != ((a^c) >> 31)) return false;
+    MD5_STEP(II, d, a, b, c, block[15], 0xfe2ce6e0, 10);
+    if (0 != ((b^d) >> 31)) return false;
+    MD5_STEP(II, c, d, a, b, block[6], 0xa3014314, 15);
+    if (0 != ((a^c) >> 31)) return false;
+    MD5_STEP(II, b, c, d, a, block[13], 0x4e0811a1, 21);
+    if (0 == ((b^d) >> 31)) return false;
+    MD5_STEP(II, a, b, c, d, block[4], 0xf7537e82, 6);
+    if (0 != ((a^c) >> 31)) return false;
+    MD5_STEP(II, d, a, b, c, block[11], 0xbd3af235, 10);
+    if (0 != ((b^d) >> 31)) return false;
+    MD5_STEP(II, c, d, a, b, block[2], 0x2ad7d2bb, 15);
+    if (0 != ((a^c) >> 31)) return false;
+    MD5_STEP(II, b, c, d, a, block[9], 0xeb86d391, 21);
+
+    uint32 block2[16];
+    uint32 V1[4], V2[4];
+    for (int t=0;t<4;++t) { V1[t]=IV[t]; V2[t]=IV[t]+(1u<<31); }
+    V2[1] += (1u<<25); V2[2] += (1u<<25); V2[3] += (1u<<25);
+    for (int t=0;t<16;++t) block2[t]=block[t];
+    block2[4] += 1u<<31; block2[11] -= 1u<<15; block2[14] += 1u<<31;
+    md5_compress(V1,block); md5_compress(V2,block2);
+    return V2[0]==V1[0] && V2[1]==V1[1] && V2[2]==V1[2] && V2[3]==V1[3];
+}
 
 namespace {
 const std::vector<uint32> q4mask = [] {
@@ -170,6 +211,60 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 				Q[Qoff + 10] = q10;
 				MD5_REVERSE_STEP(13, 0xfd987193, 12);
 
+
+#if defined(__AVX512F__)
+                const uint32 tt8v_s = FF(Q[Qoff+8], Q[Qoff+7], Q[Qoff+6]) + Q[Qoff+5] + 0x698098d8u;
+                const uint32 tt9v_s = Q[Qoff+6] + 0x8b44f7afu;
+                const uint32 tt12v_s = RR(Q[Qoff+13]-Q[Qoff+12],7)
+                    - FF(Q[Qoff+12],Q[Qoff+11],q10) - 0x6b901122u;
+                const __m512i vq9base=_mm512_set1_epi32((int)q9), vq8=_mm512_set1_epi32((int)Q[Qoff+8]), vq7=_mm512_set1_epi32((int)Q[Qoff+7]), vq10=_mm512_set1_epi32((int)q10);
+                const __m512i vtt8=_mm512_set1_epi32((int)tt8v_s), vtt9=_mm512_set1_epi32((int)tt9v_s), vtt12=_mm512_set1_epi32((int)tt12v_s);
+                const __m512i vaa0=_mm512_set1_epi32((int)aa), vbb0=_mm512_set1_epi32((int)bb), vcc0=_mm512_set1_epi32((int)cc), vdd0=_mm512_set1_epi32((int)dd);
+                const __m512i signbit=_mm512_set1_epi32((int)0x80000000u), bit15=_mm512_set1_epi32(1<<15);
+                alignas(64) uint32 la[16],lb[16],lc[16],ld[16],l8[16],l9[16],l12[16];
+#define WG(x,y,z) _mm512_xor_si512((y),_mm512_and_si512((z),_mm512_xor_si512((x),(y))))
+#define WH(x,y,z) _mm512_xor_si512(_mm512_xor_si512((x),(y)),(z))
+#define WI(x,y,z) _mm512_xor_si512((y),_mm512_or_si512((x),_mm512_xor_si512((z),_mm512_set1_epi32(-1))))
+#define WSG(A,B,C,D,M,K,R) do{(A)=_mm512_add_epi32((A),_mm512_add_epi32(WG((B),(C),(D)),_mm512_add_epi32((M),_mm512_set1_epi32((int)(K)))));(A)=_mm512_add_epi32(_mm512_rol_epi32((A),(R)),(B));}while(0)
+#define WSH(A,B,C,D,M,K,R) do{(A)=_mm512_add_epi32((A),_mm512_add_epi32(WH((B),(C),(D)),_mm512_add_epi32((M),_mm512_set1_epi32((int)(K)))));(A)=_mm512_add_epi32(_mm512_rol_epi32((A),(R)),(B));}while(0)
+#define WSI(A,B,C,D,M,K,R) do{(A)=_mm512_add_epi32((A),_mm512_add_epi32(WI((B),(C),(D)),_mm512_add_epi32((M),_mm512_set1_epi32((int)(K)))));(A)=_mm512_add_epi32(_mm512_rol_epi32((A),(R)),(B));}while(0)
+                for(unsigned k9=0;k9<q9mask2.size();k9+=16){
+                    __m512i q9v=_mm512_xor_si512(vq9base,_mm512_loadu_si512((const void*)(&q9mask2[k9])));
+                    __m512i b12v=_mm512_sub_epi32(vtt12,q9v);
+                    __m512i b8v=_mm512_sub_epi32(_mm512_ror_epi32(_mm512_sub_epi32(q9v,vq8),7),vtt8);
+                    __m512i ff9=_mm512_xor_si512(vq7,_mm512_and_si512(q9v,_mm512_xor_si512(vq8,vq7)));
+                    __m512i b9v=_mm512_sub_epi32(_mm512_sub_epi32(_mm512_ror_epi32(_mm512_sub_epi32(vq10,q9v),12),ff9),vtt9);
+                    __m512i a=vaa0,b=vbb0,c=vcc0,d=vdd0;
+                    WSG(a,b,c,d,b9v,0x21e1cde6,5); WSG(d,a,b,c,_mm512_set1_epi32((int)block[14]),0xc33707d6,9);
+                    WSG(c,d,a,b,_mm512_set1_epi32((int)block[3]),0xf4d50d87,14); WSG(b,c,d,a,b8v,0x455a14ed,20);
+                    WSG(a,b,c,d,_mm512_set1_epi32((int)block[13]),0xa9e3e905,5); WSG(d,a,b,c,_mm512_set1_epi32((int)block[2]),0xfcefa3f8,9);
+                    WSG(c,d,a,b,_mm512_set1_epi32((int)block[7]),0x676f02d9,14); WSG(b,c,d,a,b12v,0x8d2a4c8a,20);
+                    WSH(a,b,c,d,_mm512_set1_epi32((int)block[5]),0xfffa3942,4); WSH(d,a,b,c,b8v,0x8771f681,11);
+                    c=_mm512_add_epi32(c,_mm512_add_epi32(WH(d,a,b),_mm512_set1_epi32((int)(block[11]+0x6d9d6122u))));
+                    __mmask16 active=_mm512_test_epi32_mask(c,bit15); if(!active) continue;
+                    c=_mm512_add_epi32(_mm512_rol_epi32(c,16),d);
+                    WSH(b,c,d,a,_mm512_set1_epi32((int)block[14]),0xfde5380c,23); WSH(a,b,c,d,_mm512_set1_epi32((int)block[1]),0xa4beea44,4);
+                    WSH(d,a,b,c,_mm512_set1_epi32((int)block[4]),0x4bdecfa9,11); WSH(c,d,a,b,_mm512_set1_epi32((int)block[7]),0xf6bb4b60,16);
+                    WSH(b,c,d,a,_mm512_set1_epi32((int)block[10]),0xbebfbc70,23); WSH(a,b,c,d,_mm512_set1_epi32((int)block[13]),0x289b7ec6,4);
+                    WSH(d,a,b,c,_mm512_set1_epi32((int)block[0]),0xeaa127fa,11); WSH(c,d,a,b,_mm512_set1_epi32((int)block[3]),0xd4ef3085,16);
+                    WSH(b,c,d,a,_mm512_set1_epi32((int)block[6]),0x04881d05,23); WSH(a,b,c,d,b9v,0xd9d4d039,4);
+                    WSH(d,a,b,c,b12v,0xe6db99e5,11); WSH(c,d,a,b,_mm512_set1_epi32((int)block[15]),0x1fa27cf8,16);
+                    WSH(b,c,d,a,_mm512_set1_epi32((int)block[2]),0xc4ac5665,23); active&=_mm512_testn_epi32_mask(_mm512_xor_si512(b,d),signbit); if(!active) continue;
+                    WSI(a,b,c,d,_mm512_set1_epi32((int)block[0]),0xf4292244,6); active&=_mm512_testn_epi32_mask(_mm512_xor_si512(a,c),signbit); if(!active) continue;
+                    WSI(d,a,b,c,_mm512_set1_epi32((int)block[7]),0x432aff97,10); active&=_mm512_test_epi32_mask(_mm512_xor_si512(b,d),signbit); if(!active) continue;
+                    WSI(c,d,a,b,_mm512_set1_epi32((int)block[14]),0xab9423a7,15); active&=_mm512_testn_epi32_mask(_mm512_xor_si512(a,c),signbit); if(!active) continue;
+                    WSI(b,c,d,a,_mm512_set1_epi32((int)block[5]),0xfc93a039,21); active&=_mm512_testn_epi32_mask(_mm512_xor_si512(b,d),signbit); if(!active) continue;
+                    _mm512_store_si512((void*)la,a);_mm512_store_si512((void*)lb,b);_mm512_store_si512((void*)lc,c);_mm512_store_si512((void*)ld,d);
+                    _mm512_store_si512((void*)l8,b8v);_mm512_store_si512((void*)l9,b9v);_mm512_store_si512((void*)l12,b12v);
+                    unsigned sm=(unsigned)active; while(sm){unsigned lane=__builtin_ctz(sm);sm&=sm-1;block[8]=l8[lane];block[9]=l9[lane];block[12]=l12[lane];if(finish_wang_candidate(block,IV,la[lane],lb[lane],lc[lane],ld[lane]))return;}
+                }
+#undef WSI
+#undef WSH
+#undef WSG
+#undef WI
+#undef WH
+#undef WG
+#else
 				for (unsigned k9 = 0; k9 < (1<<10);)
 				{
 					uint32 a = aa, b = bb, c = cc, d = dd;
@@ -265,7 +360,10 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 					if (IV2[0]==IV1[0] && IV2[1]==IV1[1] && IV2[2]==IV1[2] && IV2[3]==IV1[3])
 						return;
 
+					if (IV2[0] != IV1[0]) { }
 				}
+#endif
+
 			}
 		}
 	}
