@@ -2,18 +2,26 @@
 #include <vector>
 #include "main.hpp"
 
+namespace {
+const std::vector<uint32> q9q10mask = [] {
+	std::vector<uint32> v(1<<5);
+	for (unsigned k = 0; k < v.size(); ++k)
+		v[k] = ((k<<5) ^ (k<<6) ^ (k<<7) ^ (k<<24) ^ (k<<27)) & 0x880002a0;
+	return v;
+}();
+
+const std::vector<uint32> q9mask = [] {
+	std::vector<uint32> v(1<<9);
+	for (unsigned k = 0; k < v.size(); ++k)
+		v[k] = ((k<<1) ^ (k<<3) ^ (k<<8) ^ (k<<12) ^ (k<<15) ^ (k<<18)) & 0x04710c12;
+	return v;
+}();
+}
+
 void find_block1_stevens_11(uint32 block[], const uint32 IV[])
 {
 	uint32 Q[68] = { IV[0], IV[3], IV[2], IV[1] };
 
-	std::vector<uint32> q9q10mask(1<<5);
-	for (unsigned k = 0; k < q9q10mask.size(); ++k)
-		q9q10mask[k] = ((k<<5) ^ (k<<6) ^ (k<<7) ^ (k<<24) ^ (k<<27)) & 0x880002a0;
-	
-	std::vector<uint32> q9mask(1<<9);
-	for (unsigned k = 0; k < q9mask.size(); ++k)
-		q9mask[k] = ((k<<1) ^ (k<<3) ^ (k<<8) ^ (k<<12) ^ (k<<15) ^ (k<<18)) & 0x04710c12;
-	
 	while (true) 
 	{
 		uint32 aa = Q[Qoff] & 0x80000000;
