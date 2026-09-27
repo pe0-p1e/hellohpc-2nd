@@ -891,6 +891,7 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
         return false;
     }
 
+    const std::size_t event_begin = parser.chart.events.size();
     std::size_t note_count = 0U;
     if (cursor < cell.size()) {
         std::size_t note_begin = cursor;
@@ -915,6 +916,32 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
 
     if (note_count >= kDenseEachThreshold) {
         ++parser.warning_count;
+    }
+
+    // Cells are parsed in strictly increasing tick order.  The global
+    // reference ordering therefore only requires ordering the few events
+    // created by this one cell by (type, source byte offset).  Avoid a
+    // whole-chart O(n log n) sort.
+    for (std::size_t i = event_begin + 1U;
+         i < parser.chart.events.size(); ++i) {
+        CompactEvent value = std::move(parser.chart.events[i]);
+        std::size_t j = i;
+        while (j > event_begin) {
+            const CompactEvent& previous = parser.chart.events[j - 1U];
+            const auto previous_key = std::pair(
+                static_cast<std::uint8_t>(previous.type),
+                previous.location.byte_offset);
+            const auto value_key = std::pair(
+                static_cast<std::uint8_t>(value.type),
+                value.location.byte_offset);
+            if (!(value_key < previous_key)) {
+                break;
+            }
+            parser.chart.events[j] =
+                std::move(parser.chart.events[j - 1U]);
+            --j;
+        }
+        parser.chart.events[j] = std::move(value);
     }
 
     parser.tick += kTicksPerWhole / parser.division;
@@ -1013,10 +1040,16 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
     }
 
     FastParser parser;
+    // Reuse the worker-local event allocation carried by output.
+    parser.chart.events.swap(output.events);
+    parser.chart.events.clear();
     parser.chart.metadata.whole_bpm_milli = whole_bpm;
     parser.bpm_milli = whole_bpm;
-    parser.chart.events.reserve(
-        std::min<std::size_t>(kMaxEvents, text.size() / 12U + 8U));
+    const std::size_t estimated_events =
+        std::min<std::size_t>(kMaxEvents, text.size() / 12U + 8U);
+    if (parser.chart.events.capacity() < estimated_events) {
+        parser.chart.events.reserve(estimated_events);
+    }
 
     while (position < text.size()) {
         const std::size_t newline = text.find('\n', position);
@@ -1057,18 +1090,11 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
     parser.chart.counts.warning = parser.warning_count;
     parser.chart.warning_count = parser.warning_count;
 
-    std::sort(
-        parser.chart.events.begin(), parser.chart.events.end(),
-        [](const CompactEvent& lhs, const CompactEvent& rhs) {
-            return std::tuple(
-                       lhs.tick, static_cast<std::uint8_t>(lhs.type),
-                       lhs.location.byte_offset) <
-                   std::tuple(
-                       rhs.tick, static_cast<std::uint8_t>(rhs.type),
-                       rhs.location.byte_offset);
-        });
-
-    output = std::move(parser.chart);
+    output.metadata = parser.chart.metadata;
+    output.counts = parser.chart.counts;
+    output.warning_count = parser.chart.warning_count;
+    output.max_tick = parser.chart.max_tick;
+    output.events.swap(parser.chart.events);
     return true;
 }
 
@@ -1290,7 +1316,7 @@ void process_chart(
     std::uint64_t chart_id,
     std::string_view chart_text,
     std::span<std::uint8_t, kEncodedChartBytes> output) {
-    FastChart fast_chart;
+    static thread_local FastChart fast_chart;
     ParsedChart parsed_chart;
     const bool fast = fast_parse_valid(chart_text, fast_chart);
     if (!fast) [[unlikely]] {
