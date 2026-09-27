@@ -27,8 +27,13 @@
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #if defined(__linux__)
-#include <asm/hwcap.h>
 #include <sys/auxv.h>
+#if __has_include(<asm/hwcap.h>)
+#include <asm/hwcap.h>
+#endif
+#ifndef HWCAP_SHA2
+#define HWCAP_SHA2 (1UL << 6)
+#endif
 #endif
 #endif
 
@@ -236,10 +241,18 @@ __attribute__((target("+crypto"), noinline))
 }
 #endif
 
-[[nodiscard]] inline bool runtime_has_sha2() noexcept {
-#if defined(__aarch64__) && defined(__linux__) && defined(HWCAP_SHA2)
-    static const bool available =
-        (::getauxval(AT_HWCAP) & static_cast<unsigned long>(HWCAP_SHA2)) != 0UL;
+[[nodiscard]] inline bool runtime_use_arm_sha2() noexcept {
+#if defined(__aarch64__) && defined(__linux__)
+    static const bool available = []() noexcept {
+        if ((::getauxval(AT_HWCAP) &
+             static_cast<unsigned long>(HWCAP_SHA2)) == 0UL) {
+            return false;
+        }
+        const std::array<std::uint8_t, 3> probe = {'a', 'b', 'c'};
+        const auto bytes = std::span<const std::uint8_t>(
+            probe.data(), probe.size());
+        return sha256_arm_sha2(bytes) == sha256(bytes);
+    }();
     return available;
 #else
     return false;
@@ -249,7 +262,7 @@ __attribute__((target("+crypto"), noinline))
 [[nodiscard]] inline Digest frame_sha256(
     std::span<const std::uint8_t> bytes) {
 #if defined(__aarch64__)
-    if (runtime_has_sha2()) [[likely]] {
+    if (runtime_use_arm_sha2()) [[likely]] {
         return sha256_arm_sha2(bytes);
     }
 #endif
