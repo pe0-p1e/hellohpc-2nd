@@ -16,14 +16,14 @@ include Makefile.inc
 
 # Input files
 C++FILES = ABE.o Ansorg.o Block.o misc.o monitor.o Parallel.o MPatch.o var.o \
-	cgh.o bssn_class.o surface_integral.o ShellPatch.o \
+	cgh.o bssn_class.o surface_integral_fast.o surface_integral.o ShellPatch.o \
 	bssnEScalar_class.o perf.o Z4c_class.o NullShellPatch.o \
 	bssnEM_class.o cpbc_util.o z4c_rhs_point.o checkpoint.o \
 	Parallel_bam.o scalar_class.o transpbh.o NullShellPatch2.o \
 	NullShellPatch2_Evo.o writefile_f.o
 
 C++FILES_GPU = ABE.o Ansorg.o Block.o misc.o monitor.o Parallel.o MPatch.o var.o \
-	cgh.o surface_integral.o ShellPatch.o \
+	cgh.o surface_integral_fast.o surface_integral.o ShellPatch.o \
 	bssnEScalar_class.o perf.o Z4c_class.o NullShellPatch.o \
 	bssnEM_class.o cpbc_util.o z4c_rhs_point.o checkpoint.o \
 	Parallel_bam.o scalar_class.o transpbh.o NullShellPatch2.o \
