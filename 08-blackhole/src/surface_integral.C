@@ -82,6 +82,7 @@ struct BHFourierOp {
   std::vector<int> corr;
   std::vector<double> w;   // exact-size interleaved cos/sin weights
   std::vector<double> cw;  // sparse I parity corrections
+  std::vector<size_t> theta_begin; // nth+1 offsets after warmup sort
 };
 
 struct BHFastCache {
@@ -506,6 +507,42 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
           }
         }
       }
+
+      // Group sparse rows by theta so the timed path can keep all |m|
+      // Fourier accumulators local until the group is complete.
+      const size_t nr=op.th.size();
+      std::vector<size_t> order(nr);
+      for(size_t i=0;i<nr;++i) order[i]=i;
+      std::stable_sort(order.begin(),order.end(),
+        [&op](size_t a,size_t b){ return op.th[a] < op.th[b]; });
+
+      std::vector<const double*> nraddr(nr), niaddr(nr);
+      std::vector<unsigned short> nthv(nr);
+      std::vector<int> ncorr(nr);
+      std::vector<double> nw(nr*(size_t)2*c.nm);
+      for(size_t dst=0;dst<nr;++dst) {
+        const size_t src=order[dst];
+        nraddr[dst]=op.raddr[src];
+        niaddr[dst]=op.iaddr[src];
+        nthv[dst]=op.th[src];
+        ncorr[dst]=op.corr[src];
+        std::copy(&op.w[src*(size_t)2*c.nm],
+                  &op.w[(src+1)*(size_t)2*c.nm],
+                  &nw[dst*(size_t)2*c.nm]);
+      }
+      op.raddr.swap(nraddr);
+      op.iaddr.swap(niaddr);
+      op.th.swap(nthv);
+      op.corr.swap(ncorr);
+      op.w.swap(nw);
+
+      op.theta_begin.assign((size_t)c.nth+1,nr);
+      size_t pos=0;
+      for(int t=0;t<c.nth;++t) {
+        op.theta_begin[t]=pos;
+        while(pos<nr && (int)op.th[pos]==t) ++pos;
+      }
+      op.theta_begin[c.nth]=nr;
     }
 
     c.pts.clear();
@@ -559,30 +596,95 @@ static inline void bh_eval_medium21_avx512(const BHFullDet &op,
 #endif
 
 template<int NM>
-static inline void bh_fourier_rows_fixed(BHFastCache &c,int d) {
+static inline void bh_fourier_theta_grouped(BHFastCache &c,int d) {
   const BHFourierOp &op=c.fop[d];
-  const size_t rows=op.th.size();
-  for(size_t j=0;j<rows;++j) {
-    const double rv=*op.raddr[j], iv=*op.iaddr[j];
-    double *ff=&c.fourier[bh_fidx(c,d,(int)op.th[j],0,0)];
-    const double *w=&op.w[j*(2*NM)];
-    for(int m=0;m<NM;++m) {
-      const double wc=w[2*m],ws=w[2*m+1];
-      ff[4*m]   += wc*rv;
-      ff[4*m+1] += ws*rv;
-      ff[4*m+2] += wc*iv;
-      ff[4*m+3] += ws*iv;
-    }
-    const int ci=op.corr[j];
-    if(ci>=0) {
-      const double *cw=&op.cw[(size_t)ci*(2*NM)];
+
+  for(int t=0;t<c.nth;++t) {
+    const size_t beg=op.theta_begin[t], end=op.theta_begin[t+1];
+    if(beg==end) continue;
+
+    double rc[NM], rs[NM], ic[NM], is[NM];
+    for(int m=0;m<NM;++m) rc[m]=rs[m]=ic[m]=is[m]=0.0;
+
+    for(size_t j=beg;j<end;++j) {
+      const double rv=*op.raddr[j], iv=*op.iaddr[j];
+      const double *w=&op.w[j*(2*NM)];
+      #pragma GCC unroll 10
       for(int m=0;m<NM;++m) {
-        ff[4*m+2] += cw[2*m]*iv;
-        ff[4*m+3] += cw[2*m+1]*iv;
+        const double wc=w[2*m], ws=w[2*m+1];
+        rc[m] += wc*rv;
+        rs[m] += ws*rv;
+        ic[m] += wc*iv;
+        is[m] += ws*iv;
       }
+
+      const int ci=op.corr[j];
+      if(ci>=0) {
+        const double *cw=&op.cw[(size_t)ci*(2*NM)];
+        #pragma GCC unroll 10
+        for(int m=0;m<NM;++m) {
+          ic[m] += cw[2*m]*iv;
+          is[m] += cw[2*m+1]*iv;
+        }
+      }
+    }
+
+    double *ff=&c.fourier[bh_fidx(c,d,t,0,0)];
+    for(int m=0;m<NM;++m) {
+      ff[4*m]=rc[m];
+      ff[4*m+1]=rs[m];
+      ff[4*m+2]=ic[m];
+      ff[4*m+3]=is[m];
     }
   }
 }
+
+#ifdef __AVX512F__
+static inline void bh_fourier_theta8_avx512(BHFastCache &c,int d) {
+  const BHFourierOp &op=c.fop[d];
+  for(int t=0;t<c.nth;++t) {
+    const size_t beg=op.theta_begin[t],end=op.theta_begin[t+1];
+    if(beg==end) continue;
+
+    __m512d rc=_mm512_setzero_pd(),rs=_mm512_setzero_pd();
+    __m512d ic=_mm512_setzero_pd(),is=_mm512_setzero_pd();
+
+    for(size_t j=beg;j<end;++j) {
+      const __m512d rv=_mm512_set1_pd(*op.raddr[j]);
+      const __m512d iv=_mm512_set1_pd(*op.iaddr[j]);
+
+      // NM=8, weights are interleaved [c0,s0,c1,s1,...].
+      const double *w=&op.w[j*16u];
+      alignas(64) double wcA[8],wsA[8];
+      for(int m=0;m<8;++m){wcA[m]=w[2*m];wsA[m]=w[2*m+1];}
+      const __m512d wc=_mm512_load_pd(wcA);
+      const __m512d ws=_mm512_load_pd(wsA);
+
+      rc=_mm512_fmadd_pd(wc,rv,rc);
+      rs=_mm512_fmadd_pd(ws,rv,rs);
+      ic=_mm512_fmadd_pd(wc,iv,ic);
+      is=_mm512_fmadd_pd(ws,iv,is);
+
+      const int ci=op.corr[j];
+      if(ci>=0) {
+        const double *cw=&op.cw[(size_t)ci*16u];
+        alignas(64) double ccA[8],csA[8];
+        for(int m=0;m<8;++m){ccA[m]=cw[2*m];csA[m]=cw[2*m+1];}
+        ic=_mm512_fmadd_pd(_mm512_load_pd(ccA),iv,ic);
+        is=_mm512_fmadd_pd(_mm512_load_pd(csA),iv,is);
+      }
+    }
+
+    alignas(64) double a[8],b[8],cc[8],dd[8];
+    _mm512_store_pd(a,rc); _mm512_store_pd(b,rs);
+    _mm512_store_pd(cc,ic); _mm512_store_pd(dd,is);
+    double *ff=&c.fourier[bh_fidx(c,d,t,0,0)];
+    for(int m=0;m<8;++m){
+      ff[4*m]=a[m]; ff[4*m+1]=b[m]; ff[4*m+2]=cc[m]; ff[4*m+3]=dd[m];
+    }
+  }
+}
+#endif
 
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   if(c.use_fullop) {
@@ -621,8 +723,12 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
     std::fill(c.local.begin(),c.local.end(),0.0);
 
     for(int d=0; d<c.ndet; ++d) {
-      if(c.nm==8) bh_fourier_rows_fixed<8>(c,d);
-      else if(c.nm==10) bh_fourier_rows_fixed<10>(c,d);
+#ifdef __AVX512F__
+      if(c.nm==8) bh_fourier_theta8_avx512(c,d);
+      else
+#endif
+      if(c.nm==8) bh_fourier_theta_grouped<8>(c,d);
+      else if(c.nm==10) bh_fourier_theta_grouped<10>(c,d);
       else {
         const BHFourierOp &op=c.fop[d];
         for(size_t j=0;j<op.th.size();++j) {
