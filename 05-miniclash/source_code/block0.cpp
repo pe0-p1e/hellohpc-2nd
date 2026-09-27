@@ -2,6 +2,17 @@
 #include <vector>
 #include "main.hpp"
 
+typedef uint32 v4u32 __attribute__((vector_size(16)));
+static inline v4u32 V(uint32 x) { return (v4u32){x,x,x,x}; }
+static inline v4u32 vFF(v4u32 b, v4u32 c, v4u32 d) { return d ^ (b & (c ^ d)); }
+static inline v4u32 vGG(v4u32 b, v4u32 c, v4u32 d) { return c ^ (d & (b ^ c)); }
+static inline v4u32 vHH(v4u32 b, v4u32 c, v4u32 d) { return b ^ c ^ d; }
+static inline v4u32 vII(v4u32 b, v4u32 c, v4u32 d) { return c ^ (b | ~d); }
+static inline v4u32 vRL(v4u32 x, unsigned n) { return (x << n) | (x >> (32-n)); }
+static inline v4u32 vRR(v4u32 x, unsigned n) { return (x >> n) | (x << (32-n)); }
+#define VMD5_STEP(f,a,b,c,d,m,ac,rc) do { a += f(b,c,d) + (m) + V(ac); a = vRL(a,rc) + b; } while(0)
+
+
 uint32 seed32_1, seed32_2;
 
 void find_block0(uint32 block[], const uint32 IV[])
@@ -156,116 +167,131 @@ void find_block0(uint32 block[], const uint32 IV[])
 				// iterate over possible changes of q9
 				// while keeping intact conditions on q1-q24
 				// this changes m8, m9 and m12 (but not m10!)
-				for (unsigned counter4 = 0; counter4 < (1<<16); ++counter4)
+				for (unsigned counter4 = 0; counter4 < (1<<16); counter4 += 4)
 				{
-					uint32 q9 = Q[Qoff + 9] ^ q9mask[counter4];
-					block[12] = tt12 - FF(Q[Qoff + 12], Q[Qoff + 11], q10) - q9;
-					uint32 m8 = q9 - Q[Qoff + 8];
-					block[8] = RR(m8, 7) - tt8; 
-					uint32 m9 = q10 - q9;
-					block[9] = RR(m9, 12) - FF(q9, Q[Qoff + 8], Q[Qoff + 7]) - tt9; 
+					const v4u32 q9 = (v4u32){
+						Q[Qoff + 9] ^ q9mask[counter4 + 0],
+						Q[Qoff + 9] ^ q9mask[counter4 + 1],
+						Q[Qoff + 9] ^ q9mask[counter4 + 2],
+						Q[Qoff + 9] ^ q9mask[counter4 + 3]
+					};
+					const v4u32 m12 = V(tt12 - FF(Q[Qoff + 12], Q[Qoff + 11], q10)) - q9;
+					const v4u32 m8 = vRR(q9 - V(Q[Qoff + 8]), 7) - V(tt8);
+					const v4u32 m9 = vRR(V(q10) - q9, 12)
+						- vFF(q9, V(Q[Qoff + 8]), V(Q[Qoff + 7])) - V(tt9);
 
-					uint32 a = aa, b = bb, c = cc, d = dd;
-					MD5_STEP(GG, a, b, c, d, block[9], 0x21e1cde6, 5);
-					MD5_STEP(GG, d, a, b, c, block[14], 0xc33707d6, 9);
-					MD5_STEP(GG, c, d, a, b, block[3], 0xf4d50d87, 14);
-					MD5_STEP(GG, b, c, d, a, block[8], 0x455a14ed, 20);
-					MD5_STEP(GG, a, b, c, d, block[13], 0xa9e3e905, 5);
-					MD5_STEP(GG, d, a, b, c, block[2], 0xfcefa3f8, 9);
-					MD5_STEP(GG, c, d, a, b, block[7], 0x676f02d9, 14);
-					MD5_STEP(GG, b, c, d, a, block[12], 0x8d2a4c8a, 20);
-					MD5_STEP(HH, a, b, c, d, block[5], 0xfffa3942, 4);
-					MD5_STEP(HH, d, a, b, c, block[8], 0x8771f681, 11);
+					v4u32 a = V(aa), b = V(bb), c = V(cc), d = V(dd);
+					VMD5_STEP(vGG, a, b, c, d, m9,          0x21e1cde6, 5);
+					VMD5_STEP(vGG, d, a, b, c, V(block[14]), 0xc33707d6, 9);
+					VMD5_STEP(vGG, c, d, a, b, V(block[3]),  0xf4d50d87, 14);
+					VMD5_STEP(vGG, b, c, d, a, m8,          0x455a14ed, 20);
+					VMD5_STEP(vGG, a, b, c, d, V(block[13]), 0xa9e3e905, 5);
+					VMD5_STEP(vGG, d, a, b, c, V(block[2]),  0xfcefa3f8, 9);
+					VMD5_STEP(vGG, c, d, a, b, V(block[7]),  0x676f02d9, 14);
+					VMD5_STEP(vGG, b, c, d, a, m12,         0x8d2a4c8a, 20);
+					VMD5_STEP(vHH, a, b, c, d, V(block[5]),  0xfffa3942, 4);
+					VMD5_STEP(vHH, d, a, b, c, m8,          0x8771f681, 11);
 
-					c += HH(d, a, b) + block[11] + 0x6d9d6122;
-					if (0 != (c & (1 << 15))) 
-						continue;
-					c = (c<<16 | c>>16) + d;
-					
-					MD5_STEP(HH, b, c, d, a, block[14], 0xfde5380c, 23);
-					MD5_STEP(HH, a, b, c, d, block[1], 0xa4beea44, 4);
-					MD5_STEP(HH, d, a, b, c, block[4], 0x4bdecfa9, 11);
-					MD5_STEP(HH, c, d, a, b, block[7], 0xf6bb4b60, 16);
-					MD5_STEP(HH, b, c, d, a, block[10], 0xbebfbc70, 23);
-					MD5_STEP(HH, a, b, c, d, block[13], 0x289b7ec6, 4);
-					MD5_STEP(HH, d, a, b, c, block[0], 0xeaa127fa, 11);
-					MD5_STEP(HH, c, d, a, b, block[3], 0xd4ef3085, 16);
-					MD5_STEP(HH, b, c, d, a, block[6], 0x04881d05, 23);
-					MD5_STEP(HH, a, b, c, d, block[9], 0xd9d4d039, 4);
-					MD5_STEP(HH, d, a, b, c, block[12], 0xe6db99e5, 11);
-					MD5_STEP(HH, c, d, a, b, block[15], 0x1fa27cf8, 16);
-					MD5_STEP(HH, b, c, d, a, block[2], 0xc4ac5665, 23);
-					if (0 != ((b^d) & 0x80000000))
-						continue;
+					c += vHH(d, a, b) + V(block[11]) + V(0x6d9d6122);
+					v4u32 valid = ((c & V(1u << 15)) == V(0));
+					c = vRL(c, 16) + d;
 
-					MD5_STEP(II, a, b, c, d, block[0], 0xf4292244, 6);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, d, a, b, c, block[7], 0x432aff97, 10);
-					if (0 == ((b^d) >> 31)) continue;
-					MD5_STEP(II, c, d, a, b, block[14], 0xab9423a7, 15);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, b, c, d, a, block[5], 0xfc93a039, 21);
-					if (0 != ((b^d) >> 31)) continue;
-					MD5_STEP(II, a, b, c, d, block[12], 0x655b59c3, 6);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, d, a, b, c, block[3], 0x8f0ccc92, 10);
-					if (0 != ((b^d) >> 31)) continue;
-					MD5_STEP(II, c, d, a, b, block[10], 0xffeff47d, 15);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, b, c, d, a, block[1], 0x85845dd1, 21);
-					if (0 != ((b^d) >> 31)) continue;
-					MD5_STEP(II, a, b, c, d, block[8], 0x6fa87e4f, 6);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, d, a, b, c, block[15], 0xfe2ce6e0, 10);
-					if (0 != ((b^d) >> 31)) continue;
-					MD5_STEP(II, c, d, a, b, block[6], 0xa3014314, 15);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, b, c, d, a, block[13], 0x4e0811a1, 21);
-					if (0 == ((b^d) >> 31)) continue;
-					MD5_STEP(II, a, b, c, d, block[4], 0xf7537e82, 6);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, d, a, b, c, block[11], 0xbd3af235, 10);
-					if (0 != ((b^d) >> 31)) continue;
-					MD5_STEP(II, c, d, a, b, block[2], 0x2ad7d2bb, 15);
-					if (0 != ((a^c) >> 31)) continue;
-					MD5_STEP(II, b, c, d, a, block[9], 0xeb86d391, 21);
+					VMD5_STEP(vHH, b, c, d, a, V(block[14]), 0xfde5380c, 23);
+					VMD5_STEP(vHH, a, b, c, d, V(block[1]),  0xa4beea44, 4);
+					VMD5_STEP(vHH, d, a, b, c, V(block[4]),  0x4bdecfa9, 11);
+					VMD5_STEP(vHH, c, d, a, b, V(block[7]),  0xf6bb4b60, 16);
+					VMD5_STEP(vHH, b, c, d, a, V(block[10]), 0xbebfbc70, 23);
+					VMD5_STEP(vHH, a, b, c, d, V(block[13]), 0x289b7ec6, 4);
+					VMD5_STEP(vHH, d, a, b, c, V(block[0]),  0xeaa127fa, 11);
+					VMD5_STEP(vHH, c, d, a, b, V(block[3]),  0xd4ef3085, 16);
+					VMD5_STEP(vHH, b, c, d, a, V(block[6]),  0x04881d05, 23);
+					VMD5_STEP(vHH, a, b, c, d, m9,          0xd9d4d039, 4);
+					VMD5_STEP(vHH, d, a, b, c, m12,         0xe6db99e5, 11);
+					VMD5_STEP(vHH, c, d, a, b, V(block[15]), 0x1fa27cf8, 16);
+					VMD5_STEP(vHH, b, c, d, a, V(block[2]),  0xc4ac5665, 23);
+					valid &= (((b ^ d) & V(0x80000000u)) == V(0));
 
-					uint32 IHV1 = b + IV[1];
-					uint32 IHV2 = c + IV[2];
-					uint32 IHV3 = d + IV[3];
+					VMD5_STEP(vII, a, b, c, d, V(block[0]),  0xf4292244, 6);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, d, a, b, c, V(block[7]),  0x432aff97, 10);
+					valid &= (((b ^ d) & V(0x80000000u)) != V(0));
+					VMD5_STEP(vII, c, d, a, b, V(block[14]), 0xab9423a7, 15);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, b, c, d, a, V(block[5]),  0xfc93a039, 21);
+					valid &= (((b ^ d) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, a, b, c, d, m12,         0x655b59c3, 6);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, d, a, b, c, V(block[3]),  0x8f0ccc92, 10);
+					valid &= (((b ^ d) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, c, d, a, b, V(block[10]), 0xffeff47d, 15);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, b, c, d, a, V(block[1]),  0x85845dd1, 21);
+					valid &= (((b ^ d) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, a, b, c, d, m8,          0x6fa87e4f, 6);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, d, a, b, c, V(block[15]), 0xfe2ce6e0, 10);
+					valid &= (((b ^ d) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, c, d, a, b, V(block[6]),  0xa3014314, 15);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, b, c, d, a, V(block[13]), 0x4e0811a1, 21);
+					valid &= (((b ^ d) & V(0x80000000u)) != V(0));
+					VMD5_STEP(vII, a, b, c, d, V(block[4]),  0xf7537e82, 6);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, d, a, b, c, V(block[11]), 0xbd3af235, 10);
+					valid &= (((b ^ d) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, c, d, a, b, V(block[2]),  0x2ad7d2bb, 15);
+					valid &= (((a ^ c) & V(0x80000000u)) == V(0));
+					VMD5_STEP(vII, b, c, d, a, m9,          0xeb86d391, 21);
 
-					bool wang = true;
-					if (0x02000000 != ((IHV2^IHV1) & 0x86000000)) wang = false;
-					if (0 != ((IHV1^IHV3) & 0x82000000)) wang = false;
-					if (0 != (IHV1 & 0x06000020)) wang = false;
-					
-					bool stevens = true;
-					if ( ((IHV1^IHV2)>>31)!=0 || ((IHV1^IHV3)>>31)!= 0 ) stevens = false;
-					if ( (IHV3&(1<<25))!=0 || (IHV2&(1<<25))!=0 || (IHV1&(1<<25))!=0 
-						|| ((IHV2^IHV1)&1)!=0) stevens = false;
-										
-					if (!(wang || stevens)) continue;
+					const v4u32 IHV1 = b + V(IV[1]);
+					const v4u32 IHV2 = c + V(IV[2]);
+					const v4u32 IHV3 = d + V(IV[3]);
 
+					v4u32 wang = (((IHV2 ^ IHV1) & V(0x86000000u)) == V(0x02000000u));
+					wang &= (((IHV1 ^ IHV3) & V(0x82000000u)) == V(0));
+					wang &= ((IHV1 & V(0x06000020u)) == V(0));
 
-					uint32 IV1[4], IV2[4];
-					for (int t = 0; t < 4; ++t)
-						IV2[t] = IV1[t] = IV[t];
+					v4u32 stevens = (((IHV1 ^ IHV2) & V(0x80000000u)) == V(0));
+					stevens &= (((IHV1 ^ IHV3) & V(0x80000000u)) == V(0));
+					stevens &= ((IHV3 & V(1u<<25)) == V(0));
+					stevens &= ((IHV2 & V(1u<<25)) == V(0));
+					stevens &= ((IHV1 & V(1u<<25)) == V(0));
+					stevens &= (((IHV2 ^ IHV1) & V(1)) == V(0));
+					valid &= (wang | stevens);
 
-					uint32 block2[16];
-					for (int t = 0; t < 16; ++t)
-						block2[t] = block[t];
-					block2[4] += 1<<31;
-					block2[11] += 1<<15;
-					block2[14] += 1<<31;
+					uint32 valid_lane[4], m8_lane[4], m9_lane[4], m12_lane[4];
+					__builtin_memcpy(valid_lane, &valid, sizeof(valid_lane));
+					__builtin_memcpy(m8_lane, &m8, sizeof(m8_lane));
+					__builtin_memcpy(m9_lane, &m9, sizeof(m9_lane));
+					__builtin_memcpy(m12_lane, &m12, sizeof(m12_lane));
 
-					md5_compress(IV1, block);
-					md5_compress(IV2, block2);
-						if (	   (IV2[0] == IV1[0] + (1<<31))
-								&& (IV2[1] == IV1[1] + (1<<31) + (1<<25))
-								&& (IV2[2] == IV1[2] + (1<<31) + (1<<25))
-								&& (IV2[3] == IV1[3] + (1<<31) + (1<<25)))
+					for (unsigned lane = 0; lane < 4; ++lane)
+					{
+						if (!valid_lane[lane]) continue;
+
+						block[8] = m8_lane[lane];
+						block[9] = m9_lane[lane];
+						block[12] = m12_lane[lane];
+
+						uint32 IV1[4], IV2[4];
+						for (int t = 0; t < 4; ++t)
+							IV2[t] = IV1[t] = IV[t];
+
+						uint32 block2[16];
+						for (int t = 0; t < 16; ++t)
+							block2[t] = block[t];
+						block2[4] += 1u<<31;
+						block2[11] += 1u<<15;
+						block2[14] += 1u<<31;
+
+						md5_compress(IV1, block);
+						md5_compress(IV2, block2);
+						if (IV2[0] == IV1[0] + (1u<<31)
+						 && IV2[1] == IV1[1] + (1u<<31) + (1u<<25)
+						 && IV2[2] == IV1[2] + (1u<<31) + (1u<<25)
+						 && IV2[3] == IV1[3] + (1u<<31) + (1u<<25))
 							return;
-
+					}
 				}
 			}
 		}
