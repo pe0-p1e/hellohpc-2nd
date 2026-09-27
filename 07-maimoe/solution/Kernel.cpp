@@ -24,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace maimoe::kernel {
 namespace {
 
@@ -33,6 +37,236 @@ constexpr std::array<std::uint8_t, 8> kFrameMagic = {
 constexpr std::array<std::uint8_t, 4> kResultMagic = {
     'M', 'M', 'R', '3'
 };
+
+#if defined(__aarch64__)
+
+alignas(16) constexpr std::array<std::uint32_t, 64> kSha256RoundConstantsArm = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+    0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+    0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+    0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+    0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+    0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+    0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+    0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+    0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+};
+
+__attribute__((target("+crypto"), noinline))
+void sha256_arm_blocks(std::uint32_t state[8],
+                       const std::uint8_t* data,
+                       std::size_t length) noexcept {
+    uint32x4_t state0 = vld1q_u32(state + 0);
+    uint32x4_t state1 = vld1q_u32(state + 4);
+
+    while (length >= 64U) {
+        const uint32x4_t save0 = state0;
+        const uint32x4_t save1 = state1;
+
+        uint32x4_t msg0 = vreinterpretq_u32_u8(
+            vrev32q_u8(vld1q_u8(data + 0U)));
+        uint32x4_t msg1 = vreinterpretq_u32_u8(
+            vrev32q_u8(vld1q_u8(data + 16U)));
+        uint32x4_t msg2 = vreinterpretq_u32_u8(
+            vrev32q_u8(vld1q_u8(data + 32U)));
+        uint32x4_t msg3 = vreinterpretq_u32_u8(
+            vrev32q_u8(vld1q_u8(data + 48U)));
+
+        uint32x4_t tmp0 = vaddq_u32(
+            msg0, vld1q_u32(kSha256RoundConstantsArm.data() + 0));
+        uint32x4_t tmp1;
+        uint32x4_t tmp2;
+
+        msg0 = vsha256su0q_u32(msg0, msg1);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg1, vld1q_u32(kSha256RoundConstantsArm.data() + 4));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+
+        msg1 = vsha256su0q_u32(msg1, msg2);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(
+            msg2, vld1q_u32(kSha256RoundConstantsArm.data() + 8));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+
+        msg2 = vsha256su0q_u32(msg2, msg3);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg3, vld1q_u32(kSha256RoundConstantsArm.data() + 12));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+        msg3 = vsha256su0q_u32(msg3, msg0);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(
+            msg0, vld1q_u32(kSha256RoundConstantsArm.data() + 16));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+
+        msg0 = vsha256su0q_u32(msg0, msg1);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg1, vld1q_u32(kSha256RoundConstantsArm.data() + 20));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+
+        msg1 = vsha256su0q_u32(msg1, msg2);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(
+            msg2, vld1q_u32(kSha256RoundConstantsArm.data() + 24));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+
+        msg2 = vsha256su0q_u32(msg2, msg3);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg3, vld1q_u32(kSha256RoundConstantsArm.data() + 28));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+        msg3 = vsha256su0q_u32(msg3, msg0);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(
+            msg0, vld1q_u32(kSha256RoundConstantsArm.data() + 32));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+
+        msg0 = vsha256su0q_u32(msg0, msg1);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg1, vld1q_u32(kSha256RoundConstantsArm.data() + 36));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg0 = vsha256su1q_u32(msg0, msg2, msg3);
+
+        msg1 = vsha256su0q_u32(msg1, msg2);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(
+            msg2, vld1q_u32(kSha256RoundConstantsArm.data() + 40));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg1 = vsha256su1q_u32(msg1, msg3, msg0);
+
+        msg2 = vsha256su0q_u32(msg2, msg3);
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg3, vld1q_u32(kSha256RoundConstantsArm.data() + 44));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+        msg2 = vsha256su1q_u32(msg2, msg0, msg1);
+
+        msg3 = vsha256su0q_u32(msg3, msg0);
+        tmp2 = state0;
+        tmp0 = vaddq_u32(
+            msg0, vld1q_u32(kSha256RoundConstantsArm.data() + 48));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+        msg3 = vsha256su1q_u32(msg3, msg1, msg2);
+
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg1, vld1q_u32(kSha256RoundConstantsArm.data() + 52));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+
+        tmp2 = state0;
+        tmp0 = vaddq_u32(
+            msg2, vld1q_u32(kSha256RoundConstantsArm.data() + 56));
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+
+        tmp2 = state0;
+        tmp1 = vaddq_u32(
+            msg3, vld1q_u32(kSha256RoundConstantsArm.data() + 60));
+        state0 = vsha256hq_u32(state0, state1, tmp0);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp0);
+
+        tmp2 = state0;
+        state0 = vsha256hq_u32(state0, state1, tmp1);
+        state1 = vsha256h2q_u32(state1, tmp2, tmp1);
+
+        state0 = vaddq_u32(state0, save0);
+        state1 = vaddq_u32(state1, save1);
+
+        data += 64U;
+        length -= 64U;
+    }
+
+    vst1q_u32(state + 0, state0);
+    vst1q_u32(state + 4, state1);
+}
+
+[[nodiscard]] Digest sha256_arm(std::span<const std::uint8_t> bytes) noexcept {
+    alignas(16) std::uint32_t state[8] = {
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U,
+    };
+
+    const std::size_t full_bytes = bytes.size() & ~std::size_t{63U};
+    if (full_bytes != 0U) {
+        sha256_arm_blocks(state, bytes.data(), full_bytes);
+    }
+
+    alignas(16) std::array<std::uint8_t, 128> tail{};
+    const std::size_t remaining = bytes.size() - full_bytes;
+    if (remaining != 0U) {
+        std::memcpy(tail.data(), bytes.data() + full_bytes, remaining);
+    }
+    tail[remaining] = 0x80U;
+
+    const std::size_t padded_bytes = remaining < 56U ? 64U : 128U;
+    const std::uint64_t bit_length =
+        static_cast<std::uint64_t>(bytes.size()) * 8ULL;
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        tail[padded_bytes - 1U - i] =
+            static_cast<std::uint8_t>(bit_length >> (8U * i));
+    }
+    sha256_arm_blocks(state, tail.data(), padded_bytes);
+
+    Digest digest{};
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        digest[4U * i + 0U] =
+            static_cast<std::uint8_t>(state[i] >> 24U);
+        digest[4U * i + 1U] =
+            static_cast<std::uint8_t>(state[i] >> 16U);
+        digest[4U * i + 2U] =
+            static_cast<std::uint8_t>(state[i] >> 8U);
+        digest[4U * i + 3U] =
+            static_cast<std::uint8_t>(state[i]);
+    }
+    return digest;
+}
+
+[[nodiscard]] inline Digest fast_frame_sha256(
+    std::span<const std::uint8_t> bytes) {
+    return sha256_arm(bytes);
+}
+
+#else
+
+[[nodiscard]] inline Digest fast_frame_sha256(
+    std::span<const std::uint8_t> bytes) {
+    return sha256(bytes);
+}
+
+#endif
 
 template <typename UInt>
 inline void store_le(std::uint8_t* dst, UInt value) noexcept {
@@ -1093,9 +1327,9 @@ void process_chart(
         fill_error_payload(begin_payload, begin_seed);
         fill_error_payload(end_payload, end_seed);
 
-        begin_digest = sha256(std::span<const std::uint8_t>(
+        begin_digest = fast_frame_sha256(std::span<const std::uint8_t>(
             begin_payload.data(), begin_payload.size()));
-        end_digest = sha256(std::span<const std::uint8_t>(
+        end_digest = fast_frame_sha256(std::span<const std::uint8_t>(
             end_payload.data(), end_payload.size()));
         result_digest = error_result_digest(
             chart_id,
@@ -1127,9 +1361,9 @@ void process_chart(
         std::array<std::uint8_t, kSerializedStateBytes> serialized_state{};
         serialize_state_into(states.frame_end, serialized_state);
 
-        begin_digest = sha256(std::span<const std::uint8_t>(
+        begin_digest = fast_frame_sha256(std::span<const std::uint8_t>(
             begin_payload.data(), begin_payload.size()));
-        end_digest = sha256(std::span<const std::uint8_t>(
+        end_digest = fast_frame_sha256(std::span<const std::uint8_t>(
             end_payload.data(), end_payload.size()));
         result_digest = valid_result_digest(
             chart_id, counts, serialized_state,
