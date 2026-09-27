@@ -6,11 +6,10 @@
 
 namespace {
 constexpr uint32_t kVectorCores = 40;
+constexpr uint32_t kShardCols = 16;
 
 uint64_t SegmentCost(uint32_t rows, uint32_t d)
 {
-    // x traffic dominates, while the additive term keeps tiny segments from
-    // being packed too unevenly. This uses only legal runtime shape metadata.
     return static_cast<uint64_t>(rows) * (static_cast<uint64_t>(d) + 8U)
         + static_cast<uint64_t>(d) * 4U + 64U;
 }
@@ -24,16 +23,36 @@ void ConfigureSolutionLaunch(uint32_t n, uint32_t d, uint32_t s, float epsilon,
     tiling->d = d;
     tiling->s = s;
     tiling->epsilon = epsilon;
-
-    const uint32_t blocks = std::min(s, kVectorCores);
-    tiling->block_count = blocks;
-    *block_dim = blocks;
-    *tiling_key = 2;
+    tiling->mode = 0;
+    tiling->block_count = 0;
+    tiling->shard_cols = 0;
+    tiling->shards_per_segment = 0;
+    tiling->task_count = 0;
 
     for (uint32_t i = 0; i < kRsmMaxBlocks; ++i) {
         tiling->segment_begin[i] = 0;
         tiling->segment_end[i] = 0;
     }
+
+    // The two public families with pathological segment-level parallelism are
+    // both low-S and wide-D. Column sharding is generic (shape-driven only):
+    // every shard independently recomputes the small score reduction, while
+    // expensive x/moment work is split across vector cores with disjoint output.
+    if (s <= 4 && d >= 192) {
+        tiling->mode = 1;
+        tiling->shard_cols = kShardCols;
+        tiling->shards_per_segment = (d + kShardCols - 1U) / kShardCols;
+        tiling->task_count = s * tiling->shards_per_segment;
+        tiling->block_count = std::min(kVectorCores, tiling->task_count);
+        *block_dim = tiling->block_count;
+        *tiling_key = 3;
+        return;
+    }
+
+    const uint32_t blocks = std::min(s, kVectorCores);
+    tiling->block_count = blocks;
+    *block_dim = blocks;
+    *tiling_key = 2;
 
     std::vector<uint64_t> prefix(static_cast<size_t>(s) + 1U, 0U);
     for (uint32_t segment = 0; segment < s; ++segment) {
@@ -48,7 +67,6 @@ void ConfigureSolutionLaunch(uint32_t n, uint32_t d, uint32_t s, float epsilon,
         const uint32_t remaining_blocks = blocks - block;
         if (remaining_blocks == 1) {
             tiling->segment_end[block] = s;
-            start = s;
             break;
         }
 
