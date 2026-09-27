@@ -14,6 +14,8 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <unordered_map>
+#include <cstdint>
 using namespace std;
 #else
 #include <iostream.h>
@@ -50,6 +52,27 @@ struct BHFastPoint {
   unsigned char zref[2 * ghost_width];
 };
 
+struct BHFourierKey {
+  Block *b;
+  int idx;
+  int th;
+  bool operator==(const BHFourierKey &o) const { return b==o.b && idx==o.idx && th==o.th; }
+};
+struct BHFourierKeyHash {
+  size_t operator()(const BHFourierKey &k) const {
+    size_t h=(reinterpret_cast<uintptr_t>(k.b)>>4) ^ (size_t(k.idx)*0x9e3779b97f4a7c15ULL);
+    return h ^ (size_t(k.th)*0xbf58476d1ce4e5b9ULL);
+  }
+};
+struct BHFourierRow {
+  Block *b;
+  int idx, th;
+  double wc[2*ghost_width+4];
+  double ws[2*ghost_width+4];
+  double wic[2*ghost_width+4];
+  double wis[2*ghost_width+4];
+};
+
 struct BHFastCache {
   bool configured, ready, valid;
   int lev, maxl, modes, ndet, ord, nth, nph, nm;
@@ -58,6 +81,7 @@ struct BHFastCache {
   std::vector<double> radii, cphi, sphi, thetaA, thetaB;
   std::vector<int> ml, mm;
   std::vector<BHFastPoint> pts;
+  std::vector<std::vector<BHFourierRow> > fop;
   std::vector<double> fourier, local, global;
   BHFastCache():configured(false),ready(false),valid(false),lev(-1),maxl(0),
     modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
@@ -306,31 +330,104 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.fourier.assign((size_t)c.ndet*nth*c.nm*4,0.0);
   c.local.assign((size_t)c.ndet*c.modes*2,0.0);
   c.global.assign((size_t)c.ndet*c.modes*2,0.0);
+
+  // Precompute sparse grid -> (theta, |m|) Fourier operator.
+  // This retains the cheap theta->(l,m) projection while removing all timed interpolation.
+  c.fop.clear();
+  c.fop.resize(c.ndet);
+  for(int d=0; d<c.ndet; ++d) {
+    std::unordered_map<BHFourierKey,int,BHFourierKeyHash> ids;
+    std::vector<BHFourierRow> &rows=c.fop[d];
+    ids.reserve(c.pts.size()/c.ndet * c.ord + 64);
+
+    for(size_t pp=0; pp<c.pts.size(); ++pp) {
+      const BHFastPoint &p=c.pts[pp];
+      if(p.det!=d) continue;
+      const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+      const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
+      const size_t tr=(size_t)p.ph*c.nm;
+
+      for(int iz=0; iz<c.ord; ++iz) {
+        const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
+        for(int iy=0; iy<c.ord; ++iy) {
+          const double wyz=wy[iy]*wz[iz];
+          for(int ix=0; ix<c.ord; ++ix) {
+            const double wR=wx[ix]*wyz;
+            const double wI=wR*izsgn;
+            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            BHFourierKey key={p.b,at,p.th};
+            int id;
+            std::unordered_map<BHFourierKey,int,BHFourierKeyHash>::iterator it=ids.find(key);
+            if(it==ids.end()) {
+              id=(int)rows.size();
+              ids.insert(std::make_pair(key,id));
+              BHFourierRow row;
+              row.b=p.b; row.idx=at; row.th=p.th;
+              for(int m=0;m<(int)(2*ghost_width+4);++m)
+                row.wc[m]=row.ws[m]=row.wic[m]=row.wis[m]=0.0;
+              rows.push_back(row);
+            } else id=it->second;
+
+            BHFourierRow &row=rows[id];
+            for(int m=0;m<c.nm;++m) {
+              const double cs=c.cphi[tr+m], sn=c.sphi[tr+m];
+              row.wc[m]  += wR*cs;
+              row.ws[m]  += wR*sn;
+              row.wic[m] += wI*cs;
+              row.wis[m] += wI*sn;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Timed path no longer needs per-surface-point interpolation metadata.
+  c.pts.clear();
+  c.pts.shrink_to_fit();
   c.valid=true;return true;
 }
 
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   std::fill(c.fourier.begin(),c.fourier.end(),0.0);
   std::fill(c.local.begin(),c.local.end(),0.0);
-  for(size_t z=0;z<c.pts.size();++z){BHFastPoint &p=c.pts[z];
-    double rr=0.0,ii=0.0;
-    bh_interp_pair(p,c.ord,
-                   p.b->fgfs[rp->sgfn],p.b->fgfs[ip->sgfn],
-                   ip->SoA[2],rr,ii);
-    size_t tr=(size_t)p.ph*c.nm;
-    for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
-      double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
-      f[0]+=rr*cs;f[1]+=rr*sn;f[2]+=ii*cs;f[3]+=ii*sn;}
+
+  for(int d=0; d<c.ndet; ++d) {
+    const std::vector<BHFourierRow> &rows=c.fop[d];
+    for(size_t j=0;j<rows.size();++j) {
+      const BHFourierRow &row=rows[j];
+      const double rv=row.b->fgfs[rp->sgfn][row.idx];
+      const double iv=row.b->fgfs[ip->sgfn][row.idx];
+      double *f=&c.fourier[bh_fidx(c,d,row.th,0,0)];
+      for(int m=0;m<c.nm;++m) {
+        f[4*m+0] += row.wc[m]*rv;
+        f[4*m+1] += row.ws[m]*rv;
+        f[4*m+2] += row.wic[m]*iv;
+        f[4*m+3] += row.wis[m]*iv;
+      }
+    }
   }
-  for(int d=0;d<c.ndet;++d){double *out=&c.local[(size_t)d*c.modes*2];double r=c.radii[d];
-    for(int q=0;q<c.modes;++q){int m=c.mm[q],ma=abs(m);double ss=m<0?-1.0:1.0,ar=0,ai=0;
-      const double *A=&c.thetaA[(size_t)q*c.nth],*B=&c.thetaB[(size_t)q*c.nth];
-      for(int t=0;t<c.nth;++t){const double *f=&c.fourier[bh_fidx(c,d,t,ma,0)];
-        double rc=f[0],rs=ss*f[1],ic=f[2],is=ss*f[3];
-        ar+=A[t]*rc+B[t]*is;ai+=B[t]*ic-A[t]*rs;}
-      out[q]=ar*r;out[c.modes+q]=ai*r;
-    }}
-  MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
+
+  for(int d=0;d<c.ndet;++d) {
+    double *out=&c.local[(size_t)d*c.modes*2];
+    double r=c.radii[d];
+    for(int q=0;q<c.modes;++q) {
+      int m=c.mm[q], ma=abs(m);
+      double ss=m<0?-1.0:1.0, ar=0.0, ai=0.0;
+      const double *A=&c.thetaA[(size_t)q*c.nth], *B=&c.thetaB[(size_t)q*c.nth];
+      for(int t=0;t<c.nth;++t) {
+        const double *f=&c.fourier[bh_fidx(c,d,t,ma,0)];
+        const double rc=f[0], rs=ss*f[1], ic=f[2], is=ss*f[3];
+        ar += A[t]*rc + B[t]*is;
+        ai += B[t]*ic - A[t]*rs;
+      }
+      out[q]=ar*r;
+      out[c.modes+q]=ai*r;
+    }
+  }
+
+  MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),
+             MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
   c.ready=true;
 }
 }
