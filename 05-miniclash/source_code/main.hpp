@@ -1,3 +1,4 @@
+#include <atomic>
 /* Use one of the following typedef's */
 //#include <stdint.h>
 //typedef ::uint32_t uint32;
@@ -12,6 +13,12 @@ void find_block1(uint32 block[], const uint32 IV[]);
 // very fast inlined xorshift random number generator with period 2^64 - 1
 // by G. Marsaglia: http://www.jstatsoft.org/v08/i14/xorshift.pdf 
 extern thread_local uint32 seed32_1, seed32_2;
+extern thread_local const std::atomic<bool>* miniclash_cancel_flag;
+inline bool miniclash_cancelled()
+{
+	return miniclash_cancel_flag
+		&& miniclash_cancel_flag->load(std::memory_order_relaxed);
+}
 inline uint32 xrng64()
 {
 	uint32 t = seed32_1 ^ (seed32_1 << 10);
