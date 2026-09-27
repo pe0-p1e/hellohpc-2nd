@@ -3,8 +3,9 @@ FC := $(if $(filter default,$(origin FC)),mpifort,$(FC))
 F77 := $(if $(filter default,$(origin F77)),mpif77,$(F77))
 
 CPPFLAGS ?= -Dfortran3 -Dnewc
-CXXFLAGS ?= -g -O3
-FCFLAGS ?= -g -O3 -cpp
+CXXFLAGS ?= -O3 -march=native -mtune=native -funroll-loops -fno-math-errno -fno-trapping-math -DNDEBUG
+FCFLAGS ?= -O3 -march=native -funroll-loops -cpp
+LDFLAGS += -Wl,--allow-multiple-definition
 LDLIBS ?= -lstdc++
 
 Cu = nvcc
