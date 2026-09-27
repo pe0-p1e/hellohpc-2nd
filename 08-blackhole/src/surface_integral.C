@@ -524,39 +524,83 @@ void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *I
     }
     MPI_Allreduce(local.data(),fast.data(),(int)fast.size(),MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
 
-    double local_max_r=0.0, local_max_i=0.0;
-    long long bad_r=-1,bad_i=-1;
-    for(int d=0;d<c.ndet;++d) {
-      double rex=c.radii[d];
-      double *pox[3];
-      for(int k=0;k<3;++k) pox[k]=new double[n_tot];
-      for(int n=0;n<n_tot;++n) {
-        pox[0][n]=rex*nx_g[n];
-        pox[1][n]=rex*ny_g[n];
-        pox[2][n]=rex*nz_g[n];
-      }
-      std::vector<double> legacy((size_t)n_tot*2,0.0);
-      MyList<var> *vl=new MyList<var>(Rpsi4);
-      vl->insert(Ipsi4);
-      GH->PatL[lev]->data->Interp_Points(vl,n_tot,pox,legacy.data(),Symmetry);
-      vl->clearList();
+    // Reproduce legacy integration ownership: each MPI rank owns one
+    // contiguous n interval after shellf has been globally assembled.
+    int world=1,rank=0;
+    MPI_Comm_size(MPI_COMM_WORLD,&world);
+    MPI_Comm_rank(MPI_COMM_WORLD,&rank);
+    const int mp=n_tot/world, Lp=n_tot-world*mp;
+    int Nmin,Nmax;
+    if(Lp>rank){Nmin=rank*mp+rank;Nmax=Nmin+mp;}
+    else {Nmin=rank*mp+Lp;Nmax=Nmin+mp-1;}
 
-      for(int n=0;n<n_tot;++n) {
-        const double dr=fabs(fast[(size_t)d*perdet+2*n]-legacy[2*n]);
-        const double di=fabs(fast[(size_t)d*perdet+2*n+1]-legacy[2*n+1]);
-        if(dr>local_max_r){local_max_r=dr;bad_r=(long long)d*n_tot+n;}
-        if(di>local_max_i){local_max_i=di;bad_i=(long long)d*n_tot+n;}
+    std::vector<double> local_modes((size_t)c.ndet*c.modes*2,0.0);
+    std::vector<double> rankfast((size_t)c.ndet*c.modes*2,0.0);
+
+    for(int d=0;d<c.ndet;++d) {
+      double *outR=&local_modes[(size_t)d*c.modes*2];
+      double *outI=outR+c.modes;
+      const double radius=c.radii[d];
+
+      // Factorized but rank-order-preserving integral.  Accumulate each
+      // theta segment only from the n values assigned to this rank.
+      for(int t=0;t<c.nth;++t) {
+        const int row0=t*c.nph, row1=row0+c.nph-1;
+        const int lo=std::max(Nmin,row0), hi=std::min(Nmax,row1);
+        if(lo>hi) continue;
+
+        double rc[16]={0},rs[16]={0},ic[16]={0},is[16]={0};
+        const size_t shellbase=(size_t)d*perdet;
+        for(int n=lo;n<=hi;++n) {
+          const int ph=n-row0;
+          const double rv=fast[shellbase+2*(size_t)n];
+          const double iv=fast[shellbase+2*(size_t)n+1];
+          const size_t tr=(size_t)ph*c.nm;
+          for(int m=0;m<c.nm;++m) {
+            const double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
+            rc[m]+=rv*cs; rs[m]+=rv*sn;
+            ic[m]+=iv*cs; is[m]+=iv*sn;
+          }
+        }
+        for(int q=0;q<c.modes;++q) {
+          const int m=c.mm[q],ma=abs(m);
+          const double ss=m<0?-1.0:1.0;
+          const double A=c.thetaA[(size_t)q*c.nth+t];
+          const double B=c.thetaB[(size_t)q*c.nth+t];
+          outR[q]+=radius*(A*rc[ma]+B*(ss*is[ma]));
+          outI[q]+=radius*(B*ic[ma]-A*(ss*rs[ma]));
+        }
       }
-      for(int k=0;k<3;++k) delete[] pox[k];
     }
 
-    double global_r=0.0,global_i=0.0;
-    MPI_Reduce(&local_max_r,&global_r,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
-    MPI_Reduce(&local_max_i,&global_i,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    MPI_Allreduce(local_modes.data(),rankfast.data(),(int)rankfast.size(),
+                  MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+
+    double max_abs=0.0,max_rel=0.0;
+    int bad_det=-1,bad_mode=-1,bad_part=-1;
+    std::vector<double> rr(c.modes),ii(c.modes);
+    c.ready=false;
+    for(int d=0;d<c.ndet;++d) {
+      surf_Wave(c.radii[d],lev,GH,Rpsi4,Ipsi4,2,c.maxl,c.modes,
+                rr.data(),ii.data(),NULL);
+      if(myrank==0) {
+        const double *q=&rankfast[(size_t)d*c.modes*2];
+        for(int m=0;m<c.modes;++m) {
+          const double vals[2]={rr[m],ii[m]};
+          const double refs[2]={q[m],q[c.modes+m]};
+          for(int part=0;part<2;++part) {
+            const double da=fabs(vals[part]-refs[part]);
+            const double dr=da/std::max(1.0e-300,fabs(vals[part]));
+            if(da>max_abs){max_abs=da;bad_det=d;bad_mode=m;bad_part=part;}
+            if(dr>max_rel)max_rel=dr;
+          }
+        }
+      }
+    }
     if(myrank==0)
-      cout<<"BH_SHELL_DEBUG maxR="<<setprecision(17)<<global_r
-          <<" maxI="<<global_i
-          <<" badR="<<bad_r<<" badI="<<bad_i<<endl;
+      cout<<"BH_RANKORDER_DEBUG max_abs="<<setprecision(17)<<max_abs
+          <<" max_rel="<<max_rel<<" det="<<bad_det<<" mode="<<bad_mode
+          <<" part="<<(bad_part==0?"R":"I")<<endl;
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Finalize();
     std::exit(0);
