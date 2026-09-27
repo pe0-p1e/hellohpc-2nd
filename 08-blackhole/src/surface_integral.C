@@ -971,7 +971,6 @@ surface_integral::~surface_integral()
 void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
                                             int field_generation)
 {
-  (void)field_generation;
   BHFastCache &c=bhfc[this];
   c.ready=false;
   if(!c.valid || c.gh!=GH || c.lev!=lev)
@@ -984,6 +983,38 @@ void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *I
 #endif
                      dphi,myrank);
   if(c.valid) bh_eval(c,Rpsi4,Ipsi4);
+
+  if(c.valid && c.use_rankorder && field_generation==1) {
+    std::vector<double> fast=c.global;
+    std::vector<double> rr(c.modes),ii(c.modes);
+    double max_abs=0.0,max_rel=0.0;
+    int bad_det=-1,bad_mode=-1,bad_part=-1;
+    c.ready=false;
+    for(int d=0;d<c.ndet;++d) {
+      surf_Wave(c.radii[d],lev,GH,Rpsi4,Ipsi4,2,c.maxl,c.modes,
+                rr.data(),ii.data(),NULL);
+      if(myrank==0) {
+        const double *q=&fast[(size_t)d*c.modes*2];
+        for(int m=0;m<c.modes;++m) {
+          const double vals[2]={rr[m],ii[m]};
+          const double refs[2]={q[m],q[c.modes+m]};
+          for(int part=0;part<2;++part) {
+            const double da=fabs(vals[part]-refs[part]);
+            const double dr=da/std::max(1.0e-300,fabs(vals[part]));
+            if(da>max_abs){max_abs=da;bad_det=d;bad_mode=m;bad_part=part;}
+            if(dr>max_rel)max_rel=dr;
+          }
+        }
+      }
+    }
+    if(myrank==0)
+      cout<<"BH_FINAL_RANKORDER_DEBUG max_abs="<<setprecision(17)<<max_abs
+          <<" max_rel="<<max_rel<<" det="<<bad_det<<" mode="<<bad_mode
+          <<" part="<<(bad_part==0?"R":"I")<<endl;
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Finalize();
+    std::exit(0);
+  }
 }
 void surface_integral::end_wave_benchmark()
 {
