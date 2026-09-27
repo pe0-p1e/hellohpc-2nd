@@ -11,6 +11,9 @@
 #include <strstream>
 #include <cmath>
 #include <map>
+#include <vector>
+#include <algorithm>
+#include <cstdlib>
 using namespace std;
 #else
 #include <iostream.h>
@@ -32,6 +35,196 @@ using namespace std;
 #include "parameters.h"
 
 #define PI M_PI
+
+namespace {
+struct BHFastPoint {
+  Block *b;
+  int det, th, ph;
+  int idx[3][2 * ghost_width];
+  double w[3][2 * ghost_width];
+  signed char isign[2 * ghost_width];
+};
+
+struct BHFastCache {
+  bool configured, ready, valid;
+  int lev, maxl, modes, ndet, ord, nth, nph, nm;
+  double rmax, dr;
+  cgh *gh;
+  std::vector<double> radii, cphi, sphi, thetaA, thetaB;
+  std::vector<int> ml, mm;
+  std::vector<BHFastPoint> pts;
+  std::vector<double> fourier, local, global;
+  BHFastCache():configured(false),ready(false),valid(false),lev(-1),maxl(0),
+    modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
+};
+static std::map<const surface_integral*,BHFastCache> bhfc;
+
+static int bh_mode_count(int L) {
+  int n=0; for(int l=2;l<=L;++l) n+=2*l+1; return n;
+}
+
+static bool bh_read_cfg(int &L,int &nd,double &rmax,double &dr) {
+  std::map<string,string>::iterator it=parameters::str_par.find("inputpar");
+  if(it==parameters::str_par.end()) return false;
+  ifstream in(it->second.c_str(),ifstream::in); if(!in.good()) return false;
+  bool a=false,b=false,c=false,d=false; const int LEN=256; char line[LEN];
+  string str,g,k,v; int si;
+  while(in.good()) {
+    in.getline(line,LEN); str=line;
+    int st=misc::parse_parts(str,g,k,v,si); if(st<=0||g!="ABE") continue;
+    if(k=="Max mode l"){L=atoi(v.c_str());a=true;}
+    else if(k=="detector number"){nd=atoi(v.c_str());b=true;}
+    else if(k=="farest detector position"){rmax=atof(v.c_str());c=true;}
+    else if(k=="detector distance"){dr=atof(v.c_str());d=true;}
+  }
+  return a&&b&&c&&d;
+}
+
+static void bh_lagrange(int n,double x,double *w) {
+  for(int i=0;i<n;++i) {
+    double q=1.0;
+    for(int j=0;j<n;++j) if(j!=i) q*= (x-j)/(double)(i-j);
+    w[i]=q;
+  }
+}
+
+struct BHBounds { Block *b; double lo[3],hi[3]; };
+static bool bh_owns(const BHBounds &bb,const double p[3],const double h[3]) {
+  for(int d=0;d<3;++d)
+    if(p[d]-bb.lo[d] < -0.5*h[d] || p[d]-bb.hi[d] > 0.5*h[d]) return false;
+  return true;
+}
+
+static bool bh_make_point(BHFastPoint &p,Block *b,const double x[3],int ord,
+                          const var *iv) {
+  p.b=b;
+  for(int d=0;d<3;++d) {
+    if(!b->X[d]) return false;
+    double h=b->getdX(d), x0=b->X[d][0];
+    int cxi=(int)((x[d]-x0)/h+0.4)+1;
+    int cb=cxi-ord/2+1, ct=cb+ord-1, cmin=1, cmax=b->shape[d];
+#ifdef Cell
+    if(d==2 && fabs(x0)<h) cmin=-ord/2+1;
+#else
+    if(d==2 && fabs(x0)<h) cmin=-ord/2+2;
+#endif
+    if(cb<cmin){cb=cmin;ct=cb+ord-1;}
+    if(ct>cmax){ct=cmax;cb=ct+1-ord;}
+    double cx;
+#ifdef Cell
+    if(cb>0) cx=(x[d]-b->X[d][cb-1])/h;
+    else cx=(x[d]+b->X[d][-cb])/h;
+#else
+    if(cb>0) cx=(x[d]-b->X[d][cb-1])/h;
+    else cx=(x[d]+b->X[d][1-cb])/h;
+#endif
+    bh_lagrange(ord,cx,p.w[d]);
+    for(int q=0;q<ord;++q) {
+      int fi=cb+q;
+#ifdef Cell
+      p.idx[d][q]=(fi>0)?fi-1:-fi;
+#else
+      p.idx[d][q]=(fi>0)?fi-1:1-fi;
+#endif
+      if(p.idx[d][q]<0||p.idx[d][q]>=b->shape[d]) return false;
+      if(d==2) p.isign[q]=(fi>0)?1:(iv->SoA[2]<0?-1:1);
+    }
+  }
+  return true;
+}
+
+static size_t bh_fidx(const BHFastCache &c,int d,int t,int m,int z) {
+  return ((((size_t)d*c.nth+t)*c.nm+m)*4+z);
+}
+
+static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
+                     int sym,int nth,int nph,int ntot,double *nx,double *ny,double *nz,
+                     double *ct,double *qw,double dphi,int rank) {
+  if(!c.configured) {
+    if(!bh_read_cfg(c.maxl,c.ndet,c.rmax,c.dr)) return false;
+    c.modes=bh_mode_count(c.maxl); c.nm=c.maxl+1;
+    std::map<string,int>::iterator oi=parameters::int_par.find("surface interpolation order");
+    c.ord=(oi==parameters::int_par.end())?2*ghost_width:oi->second;
+    c.radii.resize(c.ndet);
+    for(int d=0;d<c.ndet;++d) c.radii[d]=c.rmax-d*c.dr;
+    c.configured=true;
+  }
+  if(sym!=1||!gh||lev<0||lev>=gh->levels||gh->grids[lev]!=1||
+     c.ord<2||c.ord>2*ghost_width||(c.ord&1)||c.maxl<2||c.ndet<1) return false;
+  Patch *pa=gh->PatL[lev]?gh->PatL[lev]->data:NULL; if(!pa) return false;
+  c.lev=lev;c.gh=gh;c.nth=nth;c.nph=nph;
+  c.ml.clear();c.mm.clear();
+  for(int l=2;l<=c.maxl;++l) for(int m=-l;m<=l;++m){c.ml.push_back(l);c.mm.push_back(m);}
+  c.cphi.resize((size_t)nph*c.nm); c.sphi.resize((size_t)nph*c.nm);
+  for(int j=0;j<nph;++j){double ph=(j+0.5)*dphi;for(int m=0;m<c.nm;++m){
+    c.cphi[(size_t)j*c.nm+m]=cos(m*ph); c.sphi[(size_t)j*c.nm+m]=sin(m*ph);}}
+  c.thetaA.resize((size_t)c.modes*nth); c.thetaB.resize((size_t)c.modes*nth);
+  for(int q=0;q<c.modes;++q){int l=c.ml[q],m=c.mm[q];double norm=sqrt((2.0*l+1)/(4.0*PI));
+    for(int i=0;i<nth;++i){double tp=norm*misc::Wigner_d_function(l,m,2,ct[i]);
+      double tm=norm*misc::Wigner_d_function(l,m,2,-ct[i]);
+#ifdef GaussInt
+      double w=qw[i]*dphi;
+#else
+      double w=dphi;
+#endif
+      c.thetaA[(size_t)q*nth+i]=(tp+tm)*w;
+      c.thetaB[(size_t)q*nth+i]=(tp-tm)*w;
+    }}
+  double h[3]={pa->getdX(0),pa->getdX(1),pa->getdX(2)};
+  std::vector<BHBounds> bs;
+  for(MyList<Block>*bp=pa->blb;bp;bp=bp->next){Block *b=bp->data;BHBounds bb;bb.b=b;
+    for(int d=0;d<3;++d){
+#ifdef Vertex
+      bb.lo[d]=feq(b->bbox[d],pa->bbox[d],h[d]/2)?b->bbox[d]+pa->lli[d]*h[d]:b->bbox[d]+(ghost_width-0.5)*h[d];
+      bb.hi[d]=feq(b->bbox[3+d],pa->bbox[3+d],h[d]/2)?b->bbox[3+d]-pa->uui[d]*h[d]:b->bbox[3+d]-(ghost_width-0.5)*h[d];
+#else
+      bb.lo[d]=feq(b->bbox[d],pa->bbox[d],h[d]/2)?b->bbox[d]+pa->lli[d]*h[d]:b->bbox[d]+ghost_width*h[d];
+      bb.hi[d]=feq(b->bbox[3+d],pa->bbox[3+d],h[d]/2)?b->bbox[3+d]-pa->uui[d]*h[d]:b->bbox[3+d]-ghost_width*h[d];
+#endif
+    }bs.push_back(bb);if(bp==pa->ble)break;}
+  int world=1;MPI_Comm_size(MPI_COMM_WORLD,&world);
+  c.pts.clear();c.pts.reserve(((size_t)ntot*c.ndet+world-1)/world*2+64);
+  for(int d=0;d<c.ndet;++d){double r=c.radii[d];
+    for(int n=0;n<ntot;++n){double x[3]={r*nx[n],r*ny[n],r*nz[n]};Block *own=NULL;
+      for(size_t k=0;k<bs.size();++k)if(bh_owns(bs[k],x,h)){own=bs[k].b;break;}
+      if(!own)return false;if(own->rank!=rank)continue;
+      BHFastPoint p;p.det=d;p.th=n/nph;p.ph=n-p.th*nph;
+      if(!bh_make_point(p,own,x,c.ord,ip))return false;c.pts.push_back(p);
+    }}
+  c.fourier.assign((size_t)c.ndet*nth*c.nm*4,0.0);
+  c.local.assign((size_t)c.ndet*c.modes*2,0.0);
+  c.global.assign((size_t)c.ndet*c.modes*2,0.0);
+  c.valid=true;return true;
+}
+
+static void bh_eval(BHFastCache &c,var *rp,var *ip) {
+  std::fill(c.fourier.begin(),c.fourier.end(),0.0);
+  std::fill(c.local.begin(),c.local.end(),0.0);
+  const int o=c.ord;
+  for(size_t z=0;z<c.pts.size();++z){const BHFastPoint &p=c.pts[z];
+    const double *R=p.b->fgfs[rp->sgfn],*I=p.b->fgfs[ip->sgfn];double rr=0,ii=0;
+    int nx=p.b->shape[0],nxy=nx*p.b->shape[1];
+    for(int k=0;k<o;++k){int bz=p.idx[2][k]*nxy;double wz=p.w[2][k],sg=p.isign[k];
+      for(int j=0;j<o;++j){int by=bz+p.idx[1][j]*nx;double wyz=wz*p.w[1][j];
+        for(int i=0;i<o;++i){int at=by+p.idx[0][i];double w=wyz*p.w[0][i];
+          rr+=w*R[at];ii+=w*sg*I[at];}}}
+    size_t tr=(size_t)p.ph*c.nm;
+    for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
+      double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
+      f[0]+=rr*cs;f[1]+=rr*sn;f[2]+=ii*cs;f[3]+=ii*sn;}
+  }
+  for(int d=0;d<c.ndet;++d){double *out=&c.local[(size_t)d*c.modes*2];double r=c.radii[d];
+    for(int q=0;q<c.modes;++q){int m=c.mm[q],ma=abs(m);double ss=m<0?-1.0:1.0,ar=0,ai=0;
+      const double *A=&c.thetaA[(size_t)q*c.nth],*B=&c.thetaB[(size_t)q*c.nth];
+      for(int t=0;t<c.nth;++t){const double *f=&c.fourier[bh_fidx(c,d,t,ma,0)];
+        double rc=f[0],rs=ss*f[1],ic=f[2],is=ss*f[3];
+        ar+=A[t]*rc+B[t]*is;ai+=B[t]*ic-A[t]*rs;}
+      out[q]=ar*r;out[c.modes+q]=ai*r;
+    }}
+  MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
+  c.ready=true;
+}
+}
 //|============================================================================
 //| Constructor
 //|============================================================================
@@ -193,9 +386,23 @@ surface_integral::~surface_integral()
 void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
                                             int field_generation)
 {
+  (void)field_generation;
+  BHFastCache &c=bhfc[this];
+  c.ready=false;
+  if(!c.valid || c.gh!=GH || c.lev!=lev)
+    c.valid=bh_build(c,lev,GH,Rpsi4,Ipsi4,Symmetry,N_theta,N_phi,n_tot,
+                     nx_g,ny_g,nz_g,arcostheta,
+#ifdef GaussInt
+                     wtcostheta,
+#else
+                     NULL,
+#endif
+                     dphi,myrank);
+  if(c.valid) bh_eval(c,Rpsi4,Ipsi4);
 }
 void surface_integral::end_wave_benchmark()
 {
+  bhfc[this].ready=false;
 }
 //|----------------------------------------------------------------
 //  spin weighted spinw component of psi4, general routine
@@ -205,6 +412,23 @@ void surface_integral::surf_Wave(double rex, int lev, cgh *GH, var *Rpsi4, var *
                                  int spinw, int maxl, int NN, double *RP, double *IP,
                                  monitor *Monitor) // NN is the length of RP and IP
 {
+  BHFastCache &fc=bhfc[this];
+  if(fc.valid && fc.ready && spinw==2 && maxl==fc.maxl && NN==fc.modes &&
+     lev==fc.lev && GH==fc.gh) {
+    int d=-1; double tol=1.0e-12*std::max(1.0,fabs(rex));
+    for(int k=0;k<fc.ndet;++k) if(fabs(rex-fc.radii[k])<=tol){d=k;break;}
+    if(d>=0) {
+      if(myrank==0) {
+        const double *q=&fc.global[(size_t)d*fc.modes*2];
+        memcpy(RP,q,sizeof(double)*NN);
+        memcpy(IP,q+fc.modes,sizeof(double)*NN);
+      } else {
+        memset(RP,0,sizeof(double)*NN);
+        memset(IP,0,sizeof(double)*NN);
+      }
+      return;
+    }
+  }
   if (myrank == 0 && GH->grids[lev] != 1)
     if (Monitor->outfile)
       Monitor->outfile << "WARNING: surface integral on multipatches" << endl;
