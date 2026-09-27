@@ -80,12 +80,21 @@ static bool bh_read_cfg(int &L,int &nd,double &rmax,double &dr) {
   return a&&b&&c&&d;
 }
 
-static void bh_lagrange(int n,double x,double *w) {
-  for(int i=0;i<n;++i) {
-    double q=1.0;
-    for(int j=0;j<n;++j) if(j!=i) q*= (x-j)/(double)(i-j);
-    w[i]=q;
+static double bh_polint_basis(int n,double x,int basis) {
+  double c[2*ghost_width],d[2*ghost_width],ho[2*ghost_width];
+  for(int i=0;i<n;++i){c[i]=d[i]=(i==basis)?1.0:0.0;ho[i]=i-x;}
+  int ns=0;double dif=fabs(x);
+  for(int i=0;i<n;++i){double dt=fabs(x-i);if(dt<dif){ns=i;dif=dt;}}
+  double y=(ns==basis)?1.0:0.0;--ns;
+  for(int m=1;m<n;++m){int nn=n-m;
+    for(int i=0;i<nn;++i){double den=(c[i+1]-d[i])/(ho[i]-ho[i+m]);
+      d[i]=ho[i+m]*den;c[i]=ho[i]*den;}
+    double dy;if(2*ns<n-m)dy=c[ns+1];else{dy=d[ns];--ns;}y+=dy;
   }
+  return y;
+}
+static void bh_lagrange(int n,double x,double *w) {
+  for(int i=0;i<n;++i) w[i]=bh_polint_basis(n,x,i);
 }
 
 struct BHBounds { Block *b; double lo[3],hi[3]; };
@@ -204,10 +213,17 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   for(size_t z=0;z<c.pts.size();++z){const BHFastPoint &p=c.pts[z];
     const double *R=p.b->fgfs[rp->sgfn],*I=p.b->fgfs[ip->sgfn];double rr=0,ii=0;
     int nx=p.b->shape[0],nxy=nx*p.b->shape[1];
-    for(int k=0;k<o;++k){int bz=p.idx[2][k]*nxy;double wz=p.w[2][k],sg=p.isign[k];
-      for(int j=0;j<o;++j){int by=bz+p.idx[1][j]*nx;double wyz=wz*p.w[1][j];
-        for(int i=0;i<o;++i){int at=by+p.idx[0][i];double w=wyz*p.w[0][i];
-          rr+=w*R[at];ii+=w*sg*I[at];}}}
+    double yzR[2*ghost_width][2*ghost_width],yzI[2*ghost_width][2*ghost_width];
+    double xR[2*ghost_width],xI[2*ghost_width];
+    for(int i=0;i<o;++i)for(int j=0;j<o;++j){double zr=0,zi=0;
+      int xy=p.idx[0][i]+p.idx[1][j]*nx;
+      for(int k=0;k<o;++k){int at=xy+p.idx[2][k]*nxy;double w=p.w[2][k];
+        zr+=w*R[at];zi+=w*p.isign[k]*I[at];}
+      yzR[i][j]=zr;yzI[i][j]=zi;}
+    for(int i=0;i<o;++i){double yr=0,yi=0;for(int j=0;j<o;++j){
+      yr+=p.w[1][j]*yzR[i][j];yi+=p.w[1][j]*yzI[i][j];}
+      xR[i]=yr;xI[i]=yi;}
+    for(int i=0;i<o;++i){rr+=p.w[0][i]*xR[i];ii+=p.w[0][i]*xI[i];}
     size_t tr=(size_t)p.ph*c.nm;
     for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
       double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
