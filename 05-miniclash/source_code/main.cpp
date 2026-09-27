@@ -376,6 +376,14 @@ bool write_batch_output(const batch_task& task, const collision_payload& payload
 	return true;
 }
 
+uint64 splitmix64(uint64& state)
+{
+	uint64 z = (state += 0x9e3779b97f4a7c15ULL);
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+	return z ^ (z >> 31);
+}
+
 int run_batch_attempt(const batch_task& task, int cpu, unsigned serial, int result_fd)
 {
 	cpu_set_t one;
@@ -383,12 +391,13 @@ int run_batch_attempt(const batch_task& task, int cpu, unsigned serial, int resu
 	CPU_SET(cpu, &one);
 	(void)sched_setaffinity(0, sizeof(one), &one);
 
-	const uint64 mix =
-		(uint64(uint32(time(NULL))) << 32)
+	uint64 seed = (uint64(uint32(time(NULL))) << 32)
 		^ uint64(uint32(getpid()))
-		^ (uint64(serial) * 0x9e3779b97f4a7c15ULL);
-	seed32_1 = uint32(mix ^ (mix >> 32) ^ 0xa5a5a5a5U);
-	seed32_2 = uint32((mix >> 17) ^ (mix << 13) ^ 0x3c6ef372U);
+		^ (uint64(serial) * 0xd1b54a32d192ed03ULL);
+	const uint64 s1 = splitmix64(seed);
+	const uint64 s2 = splitmix64(seed);
+	seed32_1 = uint32(s1 ^ (s1 >> 32));
+	seed32_2 = uint32(s2 ^ (s2 >> 32));
 	if ((seed32_1 | seed32_2) == 0)
 		seed32_2 = 1;
 
