@@ -1,10 +1,10 @@
 cpu_workers = 8
 input_readers = 0
 prefetch_depth = 0
-compute_batch = 4
+compute_batch = 1
 pipeline_mib = 128
 io_workers = 0
-write_batch = 4
+write_batch = 1
 queue_partitions = 1
 partition_steal = "shared"
 schedule_policy = "work_lpt"
