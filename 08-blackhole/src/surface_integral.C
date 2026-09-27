@@ -495,7 +495,6 @@ surface_integral::~surface_integral()
 void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *Ipsi4,
                                             int field_generation)
 {
-  (void)field_generation;
   BHFastCache &c=bhfc[this];
   c.ready=false;
   if(!c.valid || c.gh!=GH || c.lev!=lev)
@@ -507,6 +506,62 @@ void surface_integral::begin_wave_benchmark(int lev, cgh *GH, var *Rpsi4, var *I
                      NULL,
 #endif
                      dphi,myrank);
+
+  if(c.valid && field_generation==1) {
+    const size_t perdet=(size_t)n_tot*2;
+    std::vector<double> local((size_t)c.ndet*perdet,0.0);
+    std::vector<double> fast((size_t)c.ndet*perdet,0.0);
+
+    for(size_t z=0;z<c.pts.size();++z) {
+      BHFastPoint &p=c.pts[z];
+      double rr=0.0,ii=0.0;
+      bh_interp_pair(p,c.ord,
+                     p.b->fgfs[Rpsi4->sgfn],p.b->fgfs[Ipsi4->sgfn],
+                     Ipsi4->SoA[2],rr,ii);
+      const size_t n=(size_t)p.th*c.nph+p.ph;
+      local[(size_t)p.det*perdet+2*n]=rr;
+      local[(size_t)p.det*perdet+2*n+1]=ii;
+    }
+    MPI_Allreduce(local.data(),fast.data(),(int)fast.size(),MPI_DOUBLE,MPI_SUM,MPI_COMM_WORLD);
+
+    double local_max_r=0.0, local_max_i=0.0;
+    long long bad_r=-1,bad_i=-1;
+    for(int d=0;d<c.ndet;++d) {
+      double rex=c.radii[d];
+      double *pox[3];
+      for(int k=0;k<3;++k) pox[k]=new double[n_tot];
+      for(int n=0;n<n_tot;++n) {
+        pox[0][n]=rex*nx_g[n];
+        pox[1][n]=rex*ny_g[n];
+        pox[2][n]=rex*nz_g[n];
+      }
+      std::vector<double> legacy((size_t)n_tot*2,0.0);
+      MyList<var> *vl=new MyList<var>(Rpsi4);
+      vl->insert(Ipsi4);
+      GH->PatL[lev]->data->Interp_Points(vl,n_tot,pox,legacy.data(),Symmetry);
+      vl->clearList();
+
+      for(int n=0;n<n_tot;++n) {
+        const double dr=fabs(fast[(size_t)d*perdet+2*n]-legacy[2*n]);
+        const double di=fabs(fast[(size_t)d*perdet+2*n+1]-legacy[2*n+1]);
+        if(dr>local_max_r){local_max_r=dr;bad_r=(long long)d*n_tot+n;}
+        if(di>local_max_i){local_max_i=di;bad_i=(long long)d*n_tot+n;}
+      }
+      for(int k=0;k<3;++k) delete[] pox[k];
+    }
+
+    double global_r=0.0,global_i=0.0;
+    MPI_Reduce(&local_max_r,&global_r,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    MPI_Reduce(&local_max_i,&global_i,1,MPI_DOUBLE,MPI_MAX,0,MPI_COMM_WORLD);
+    if(myrank==0)
+      cout<<"BH_SHELL_DEBUG maxR="<<setprecision(17)<<global_r
+          <<" maxI="<<global_i
+          <<" badR="<<bad_r<<" badI="<<bad_i<<endl;
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Finalize();
+    std::exit(0);
+  }
+
   if(c.valid) bh_eval(c,Rpsi4,Ipsi4);
 }
 void surface_integral::end_wave_benchmark()
