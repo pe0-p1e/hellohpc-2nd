@@ -44,6 +44,10 @@ struct BHFastPoint {
   double x[3];
   int inds[3];
   double coef[6 * ghost_width];
+  int pix[2 * ghost_width];
+  int piy[2 * ghost_width];
+  int piz[2 * ghost_width];
+  unsigned char zref[2 * ghost_width];
 };
 
 struct BHFastCache {
@@ -131,7 +135,73 @@ static bool bh_prepare_interp(BHFastPoint &p,Block *b,const double x[3],
       p.coef[d*ord+basis]=yq;
     }
   }
+
+#ifdef Cell
+  for(int q=0;q<ord;++q) {
+    int lx=p.inds[0]+1+q; // Fortran logical index
+    int ly=p.inds[1]+1+q;
+    int lz=p.inds[2]+1+q;
+    p.pix[q]=(lx>0)?(lx-1):(-lx);
+    p.piy[q]=(ly>0)?(ly-1):(-ly);
+    p.piz[q]=(lz>0)?(lz-1):(-lz);
+    p.zref[q]=(lz<=0)?1:0;
+  }
+#else
+  for(int q=0;q<ord;++q) {
+    int lx=p.inds[0]+1+q;
+    int ly=p.inds[1]+1+q;
+    int lz=p.inds[2]+1+q;
+    p.pix[q]=(lx>0)?(lx-1):(1-lx);
+    p.piy[q]=(ly>0)?(ly-1):(1-ly);
+    p.piz[q]=(lz>0)?(lz-1):(1-lz);
+    p.zref[q]=(lz<=0)?1:0;
+  }
+#endif
   return true;
+}
+
+static inline void bh_interp_pair(const BHFastPoint &p,int ord,
+                                  const double *R,const double *I,
+                                  double iz_parity,double &rr,double &ii) {
+  const int nx=p.b->shape[0];
+  const int nxy=nx*p.b->shape[1];
+  double zyR[2*ghost_width][2*ghost_width];
+  double zyI[2*ghost_width][2*ghost_width];
+  double yR[2*ghost_width], yI[2*ghost_width];
+
+  const double *wz=&p.coef[2*ord];
+  const double *wy=&p.coef[ord];
+  const double *wx=&p.coef[0];
+
+  // Same contraction order as Fortran global_interpind: z -> y -> x.
+  for(int ix=0;ix<ord;++ix) {
+    const int bx=p.pix[ix];
+    for(int iy=0;iy<ord;++iy) {
+      const int bxy=bx+p.piy[iy]*nx;
+      double sr=0.0,si=0.0;
+      for(int iz=0;iz<ord;++iz) {
+        const int at=bxy+p.piz[iz]*nxy;
+        const double w=wz[iz];
+        sr += w*R[at];
+        si += w*(p.zref[iz]?iz_parity:1.0)*I[at];
+      }
+      zyR[ix][iy]=sr;
+      zyI[ix][iy]=si;
+    }
+  }
+  for(int ix=0;ix<ord;++ix) {
+    double sr=0.0,si=0.0;
+    for(int iy=0;iy<ord;++iy) {
+      sr += wy[iy]*zyR[ix][iy];
+      si += wy[iy]*zyI[ix][iy];
+    }
+    yR[ix]=sr; yI[ix]=si;
+  }
+  rr=0.0; ii=0.0;
+  for(int ix=0;ix<ord;++ix) {
+    rr += wx[ix]*yR[ix];
+    ii += wx[ix]*yI[ix];
+  }
 }
 
 static size_t bh_fidx(const BHFastCache &c,int d,int t,int m,int z) {
@@ -205,15 +275,9 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   std::fill(c.local.begin(),c.local.end(),0.0);
   for(size_t z=0;z<c.pts.size();++z){BHFastPoint &p=c.pts[z];
     double rr=0.0,ii=0.0;
-    int sym=1, sst=-1;
-    double xx=p.x[0],yy=p.x[1],zz=p.x[2];
-    f_global_interpind(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
-                       p.b->fgfs[rp->sgfn],rr,xx,yy,zz,c.ord,rp->SoA,sym,
-                       p.inds,p.coef,sst);
-    xx=p.x[0];yy=p.x[1];zz=p.x[2];
-    f_global_interpind(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
-                       p.b->fgfs[ip->sgfn],ii,xx,yy,zz,c.ord,ip->SoA,sym,
-                       p.inds,p.coef,sst);
+    bh_interp_pair(p,c.ord,
+                   p.b->fgfs[rp->sgfn],p.b->fgfs[ip->sgfn],
+                   ip->SoA[2],rr,ii);
     size_t tr=(size_t)p.ph*c.nm;
     for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
       double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
