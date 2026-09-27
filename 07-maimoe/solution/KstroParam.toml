@@ -1,7 +1,7 @@
 cpu_workers = 8
-input_readers = 1
-prefetch_depth = 32
-compute_batch = 1
+input_readers = 0
+prefetch_depth = 0
+compute_batch = 4
 pipeline_mib = 128
 io_workers = 1
 write_batch = 16
