@@ -266,7 +266,6 @@ void find_block0(uint32 block[], const uint32 IV[])
 								&& (IV2[3] == IV1[3] + (1<<31) + (1<<25)))
 							return;
 
-					if (IV2[0] != IV1[0] + (1<<31))
 				}
 			}
 		}
