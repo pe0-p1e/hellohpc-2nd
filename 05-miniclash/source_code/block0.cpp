@@ -95,6 +95,7 @@ void find_block0(uint32 block[], const uint32 IV[])
 
 	while (true)
 	{
+		if (miniclash_cancelled()) return;
 		Q[Qoff + 1] = xrng64();
 		Q[Qoff + 3] = (xrng64() & 0xfe87bc3f) | 0x017841c0;
 		Q[Qoff + 4] = (xrng64() & 0x44000033) | 0x000002c0 | (Q[Qoff + 3] & 0x0287bc00);
@@ -267,6 +268,7 @@ void find_block0(uint32 block[], const uint32 IV[])
 
                 for (unsigned counter4 = 0; counter4 < (1u<<16); counter4 += 16)
                 {
+                    if ((counter4 & 4095u) == 0 && miniclash_cancelled()) return;
                     __m512i q9v = _mm512_xor_si512(vq9base,
                         _mm512_loadu_si512((const void*)(&q9mask[counter4])));
                     __m512i b12v = _mm512_sub_epi32(
