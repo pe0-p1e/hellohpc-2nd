@@ -299,23 +299,61 @@ inline void hash_lp32(Sha256& hasher, std::string_view value) {
 [[nodiscard]] Digest valid_result_digest(
     std::uint64_t chart_id,
     const Counts& counts,
-    std::span<const std::uint8_t, kSerializedStateBytes> state,
+    const State& state,
     const Digest& frame_begin,
     const Digest& frame_end) {
-    Sha256 hasher;
-    hash_lp32(hasher, std::string_view("MaiMoeResult/v3"));
-    hash_le(hasher, chart_id);
-    hash_le(hasher, counts.total);
-    hash_le(hasher, counts.tap);
-    hash_le(hasher, counts.slide);
-    hash_le(hasher, counts.hold);
-    hash_le(hasher, counts.touch);
-    hash_le(hasher, counts.break_count);
-    hash_le(hasher, counts.warning);
-    hash_lp32(hasher, std::span<const std::uint8_t>(state.data(), state.size()));
-    hash_lp32(hasher, std::span<const std::uint8_t>(frame_begin.data(), frame_begin.size()));
-    hash_lp32(hasher, std::span<const std::uint8_t>(frame_end.data(), frame_end.size()));
-    return hasher.finish();
+    constexpr std::string_view tag = "MaiMoeResult/v3";
+    constexpr std::size_t kDigestInputBytes =
+        4U + tag.size() +
+        8U +
+        7U * 4U +
+        4U + kSerializedStateBytes +
+        4U + Digest{}.size() +
+        4U + Digest{}.size();
+
+    std::array<std::uint8_t, kDigestInputBytes> bytes{};
+    std::uint8_t* cursor = bytes.data();
+
+    store_le<std::uint32_t>(cursor, static_cast<std::uint32_t>(tag.size()));
+    cursor += 4U;
+    std::memcpy(cursor, tag.data(), tag.size());
+    cursor += tag.size();
+
+    store_le<std::uint64_t>(cursor, chart_id);
+    cursor += 8U;
+
+    const std::array<std::uint32_t, 7> values = {
+        counts.total, counts.tap, counts.slide, counts.hold,
+        counts.touch, counts.break_count, counts.warning,
+    };
+    for (const std::uint32_t value : values) {
+        store_le<std::uint32_t>(cursor, value);
+        cursor += 4U;
+    }
+
+    store_le<std::uint32_t>(
+        cursor, static_cast<std::uint32_t>(kSerializedStateBytes));
+    cursor += 4U;
+    serialize_state_into(
+        state,
+        std::span<std::uint8_t, kSerializedStateBytes>(
+            cursor, kSerializedStateBytes));
+    cursor += kSerializedStateBytes;
+
+    store_le<std::uint32_t>(
+        cursor, static_cast<std::uint32_t>(frame_begin.size()));
+    cursor += 4U;
+    std::memcpy(cursor, frame_begin.data(), frame_begin.size());
+    cursor += frame_begin.size();
+
+    store_le<std::uint32_t>(
+        cursor, static_cast<std::uint32_t>(frame_end.size()));
+    cursor += 4U;
+    std::memcpy(cursor, frame_end.data(), frame_end.size());
+    cursor += frame_end.size();
+
+    return frame_sha256(std::span<const std::uint8_t>(
+        bytes.data(), static_cast<std::size_t>(cursor - bytes.data())));
 }
 
 [[nodiscard]] std::array<std::uint8_t, 16> canonical_error_fields(
@@ -1359,15 +1397,12 @@ void process_chart(
             chart_id, *render_chart, states.frame_end,
             kLastSampleFrame, end_payload);
 
-        std::array<std::uint8_t, kSerializedStateBytes> serialized_state{};
-        serialize_state_into(states.frame_end, serialized_state);
-
         begin_digest = frame_sha256(std::span<const std::uint8_t>(
             begin_payload.data(), begin_payload.size()));
         end_digest = frame_sha256(std::span<const std::uint8_t>(
             end_payload.data(), end_payload.size()));
         result_digest = valid_result_digest(
-            chart_id, counts, serialized_state,
+            chart_id, counts, states.frame_end,
             begin_digest, end_digest);
     }
 
