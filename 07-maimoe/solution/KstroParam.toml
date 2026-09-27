@@ -1,11 +1,11 @@
 cpu_workers = 8
 input_readers = 1
-prefetch_depth = 32
+prefetch_depth = 64
 compute_batch = 1
-pipeline_mib = 128
-io_workers = 1
-write_batch = 16
-queue_partitions = 1
-partition_steal = "shared"
+pipeline_mib = 256
+io_workers = 8
+write_batch = 32
+queue_partitions = 8
+partition_steal = "strict"
 schedule_policy = "work_lpt"
 schedule_hybrid_weight = 100
