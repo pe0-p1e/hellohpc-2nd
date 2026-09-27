@@ -14,8 +14,6 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
-#include <unordered_map>
-#include <cstdint>
 using namespace std;
 #else
 #include <iostream.h>
@@ -42,7 +40,7 @@ using namespace std;
 namespace {
 struct BHFastPoint {
   Block *b;
-  int det, th, ph, bid;
+  int det, th, ph;
   double x[3];
   int inds[3];
   double coef[6 * ghost_width];
@@ -52,24 +50,13 @@ struct BHFastPoint {
   unsigned char zref[2 * ghost_width];
 };
 
-struct BHFourierKey {
-  Block *b;
-  int idx;
-  int th;
-  bool operator==(const BHFourierKey &o) const { return b==o.b && idx==o.idx && th==o.th; }
-};
-struct BHFourierKeyHash {
-  size_t operator()(const BHFourierKey &k) const {
-    size_t h=(reinterpret_cast<uintptr_t>(k.b)>>4) ^ (size_t(k.idx)*0x9e3779b97f4a7c15ULL);
-    return h ^ (size_t(k.th)*0xbf58476d1ce4e5b9ULL);
-  }
-};
-struct BHFourierOp {
+struct BHFullDet {
   std::vector<const double*> raddr, iaddr;
-  std::vector<unsigned short> th;
-  std::vector<int> corr;
-  std::vector<double> w;      // interleaved [cos,sin], exact 2*nm per row
-  std::vector<double> cw;     // sparse I-parity correction, exact 2*nm per correction
+  std::vector<double> rr, ri, ir, ii;
+};
+struct BHBlockIdMap {
+  Block *b;
+  std::vector<int> id;
 };
 
 struct BHFastCache {
@@ -80,8 +67,7 @@ struct BHFastCache {
   std::vector<double> radii, cphi, sphi, thetaA, thetaB;
   std::vector<int> ml, mm;
   std::vector<BHFastPoint> pts;
-  std::vector<Block*> local_blocks;
-  std::vector<BHFourierOp> fop;
+  std::vector<BHFullDet> fullop;
   std::vector<double> fourier, local, global;
   BHFastCache():configured(false),ready(false),valid(false),lev(-1),maxl(0),
     modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
@@ -316,17 +302,6 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       bb.hi[d]=feq(b->bbox[3+d],pa->bbox[3+d],h[d]/2)?b->bbox[3+d]-pa->uui[d]*h[d]:b->bbox[3+d]-ghost_width*h[d];
 #endif
     }bs.push_back(bb);if(bp==pa->ble)break;}
-
-  c.local_blocks.clear();
-  std::map<Block*,int> local_bid;
-  for(size_t k=0;k<bs.size();++k) {
-    if(bs[k].b->rank==rank) {
-      int id=(int)c.local_blocks.size();
-      local_bid[bs[k].b]=id;
-      c.local_blocks.push_back(bs[k].b);
-    }
-  }
-
   int world=1;MPI_Comm_size(MPI_COMM_WORLD,&world);
   c.pts.clear();c.pts.reserve(((size_t)ntot*c.ndet+world-1)/world*2+64);
   for(int d=0;d<c.ndet;++d){double r=c.radii[d];
@@ -334,7 +309,6 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       for(size_t k=0;k<bs.size();++k)if(bh_owns(bs[k],x,h)){own=bs[k].b;break;}
       if(!own)return false;if(own->rank!=rank)continue;
       BHFastPoint p;p.b=own;p.det=d;p.th=n/nph;p.ph=n-p.th*nph;
-      p.bid=local_bid[own];
       p.x[0]=x[0];p.x[1]=x[1];p.x[2]=x[2];
       if(!bh_prepare_interp(p,own,x,c.ord,sym)) return false;
       c.pts.push_back(p);
@@ -343,60 +317,92 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.local.assign((size_t)c.ndet*c.modes*2,0.0);
   c.global.assign((size_t)c.ndet*c.modes*2,0.0);
 
-  // Precompute sparse grid -> (theta, |m|) Fourier operator.
-  // Exact-size flattened storage avoids the old fixed [10] arrays (medium nm=5).
-  // Grid addresses are stable; field values themselves are never cached.
-  c.fop.clear(); c.fop.resize(c.ndet);
-  for(int d=0; d<c.ndet; ++d) {
-    std::unordered_map<BHFourierKey,int,BHFourierKeyHash> ids;
-    BHFourierOp &op=c.fop[d];
-    ids.reserve(c.pts.size()/c.ndet * c.ord + 64);
+  // Build the complete local grid -> mode linear operator.
+  // Geometry is fixed across iterations; only field values are read in bh_eval().
+  // A direct per-Block integer map replaces the previous hash-heavy construction.
+  c.fullop.clear();
+  c.fullop.resize(c.ndet);
 
+  for(int d=0; d<c.ndet; ++d) {
+    BHFullDet &op=c.fullop[d];
+    std::vector<BHBlockIdMap> maps;
+
+    // First pass: enumerate unique physical grid cells touched by this detector.
     for(size_t pp=0; pp<c.pts.size(); ++pp) {
       const BHFastPoint &p=c.pts[pp];
       if(p.det!=d) continue;
+
+      int bm=-1;
+      for(size_t k=0;k<maps.size();++k) if(maps[k].b==p.b){bm=(int)k;break;}
+      if(bm<0) {
+        BHBlockIdMap mm;
+        mm.b=p.b;
+        size_t nv=(size_t)p.b->shape[0]*p.b->shape[1]*p.b->shape[2];
+        mm.id.assign(nv,-1);
+        maps.push_back(mm);
+        bm=(int)maps.size()-1;
+      }
+
+      std::vector<int> &imap=maps[bm].id;
       const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+      for(int iz=0; iz<c.ord; ++iz)
+        for(int iy=0; iy<c.ord; ++iy)
+          for(int ix=0; ix<c.ord; ++ix) {
+            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            if(imap[at]<0) {
+              imap[at]=(int)op.raddr.size();
+              op.raddr.push_back(p.b->fgfs[rp->sgfn]+at);
+              op.iaddr.push_back(p.b->fgfs[ip->sgfn]+at);
+            }
+          }
+    }
+
+    const size_t nc=op.raddr.size();
+    const size_t nw=nc*(size_t)c.modes;
+    op.rr.assign(nw,0.0);
+    op.ri.assign(nw,0.0);
+    op.ir.assign(nw,0.0);
+    op.ii.assign(nw,0.0);
+
+    // Second pass: fold interpolation, phi Fourier, theta quadrature and
+    // spherical-harmonic projection into four coefficient streams.
+    for(size_t pp=0; pp<c.pts.size(); ++pp) {
+      const BHFastPoint &p=c.pts[pp];
+      if(p.det!=d) continue;
+
+      int bm=-1;
+      for(size_t k=0;k<maps.size();++k) if(maps[k].b==p.b){bm=(int)k;break;}
+      if(bm<0) return false;
+      const std::vector<int> &imap=maps[bm].id;
+
+      const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+      const double radius=c.radii[d];
       const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
-      const size_t tr=(size_t)p.ph*c.nm;
 
       for(int iz=0; iz<c.ord; ++iz) {
         const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
-        const double idelta=izsgn-1.0;
         for(int iy=0; iy<c.ord; ++iy) {
           const double wyz=wy[iy]*wz[iz];
           for(int ix=0; ix<c.ord; ++ix) {
-            const double ww=wx[ix]*wyz;
-            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
-            BHFourierKey key={p.b,at,p.th};
-            int id;
-            std::unordered_map<BHFourierKey,int,BHFourierKeyHash>::iterator it=ids.find(key);
-            if(it==ids.end()) {
-              id=(int)op.th.size();
-              ids.insert(std::make_pair(key,id));
-              op.raddr.push_back(p.b->fgfs[rp->sgfn]+at);
-              op.iaddr.push_back(p.b->fgfs[ip->sgfn]+at);
-              op.th.push_back((unsigned short)p.th);
-              op.corr.push_back(-1);
-              op.w.resize(op.w.size()+(size_t)2*c.nm,0.0);
-            } else id=it->second;
+            const double wR=wx[ix]*wyz;
+            const double wI=wR*izsgn;
+            const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            const int id=imap[at];
+            if(id<0) return false;
+            const size_t base=(size_t)id*c.modes;
 
-            double *dst=&op.w[(size_t)id*2*c.nm];
-            for(int m=0;m<c.nm;++m) {
-              dst[2*m+0] += ww*c.cphi[tr+m];
-              dst[2*m+1] += ww*c.sphi[tr+m];
-            }
+            for(int q=0; q<c.modes; ++q) {
+              const int m=c.mm[q], ma=abs(m);
+              const double ss=m<0 ? -1.0 : 1.0;
+              const double cs=c.cphi[(size_t)p.ph*c.nm+ma];
+              const double sn=c.sphi[(size_t)p.ph*c.nm+ma];
+              const double A=c.thetaA[(size_t)q*c.nth+p.th];
+              const double B=c.thetaB[(size_t)q*c.nth+p.th];
 
-            if(idelta!=0.0) {
-              if(op.corr[id]<0) {
-                op.corr[id]=(int)(op.cw.size()/(2*c.nm));
-                op.cw.resize(op.cw.size()+(size_t)2*c.nm,0.0);
-              }
-              double *cdst=&op.cw[(size_t)op.corr[id]*2*c.nm];
-              const double dw=ww*idelta;
-              for(int m=0;m<c.nm;++m) {
-                cdst[2*m+0] += dw*c.cphi[tr+m];
-                cdst[2*m+1] += dw*c.sphi[tr+m];
-              }
+              op.rr[base+q] += wR*(radius*A*cs);
+              op.ri[base+q] += wI*(radius*B*ss*sn);
+              op.ir[base+q] += wR*(-radius*A*ss*sn);
+              op.ii[base+q] += wI*(radius*B*cs);
             }
           }
         }
@@ -404,86 +410,37 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
     }
   }
 
-  // Timed path no longer needs per-surface-point interpolation metadata.
   c.pts.clear();
   c.pts.shrink_to_fit();
+  c.fourier.clear();
+  c.fourier.shrink_to_fit();
   c.valid=true;return true;
-}
-
-template<int NM>
-static inline void bh_fourier_rows_fixed(BHFastCache &c,int d) {
-  const BHFourierOp &op=c.fop[d];
-  const size_t rows=op.th.size();
-  for(size_t j=0;j<rows;++j) {
-    const double rv=*op.raddr[j];
-    const double iv=*op.iaddr[j];
-    double *f=&c.fourier[bh_fidx(c,d,(int)op.th[j],0,0)];
-    const double *w=&op.w[j*(2*NM)];
-    #pragma GCC unroll 10
-    for(int m=0;m<NM;++m) {
-      const double wc=w[2*m+0], ws=w[2*m+1];
-      f[4*m+0] += wc*rv;
-      f[4*m+1] += ws*rv;
-      f[4*m+2] += wc*iv;
-      f[4*m+3] += ws*iv;
-    }
-    const int ci=op.corr[j];
-    if(ci>=0) {
-      const double *cw=&op.cw[(size_t)ci*(2*NM)];
-      #pragma GCC unroll 10
-      for(int m=0;m<NM;++m) {
-        f[4*m+2] += cw[2*m+0]*iv;
-        f[4*m+3] += cw[2*m+1]*iv;
-      }
-    }
-  }
 }
 
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   (void)rp; (void)ip;
-  std::fill(c.fourier.begin(),c.fourier.end(),0.0);
   std::fill(c.local.begin(),c.local.end(),0.0);
 
   for(int d=0; d<c.ndet; ++d) {
-    if(c.nm==5) bh_fourier_rows_fixed<5>(c,d);
-    else if(c.nm==8) bh_fourier_rows_fixed<8>(c,d);
-    else if(c.nm==10) bh_fourier_rows_fixed<10>(c,d);
-    else {
-      const BHFourierOp &op=c.fop[d];
-      for(size_t j=0;j<op.th.size();++j) {
-        const double rv=*op.raddr[j], iv=*op.iaddr[j];
-        double *ff=&c.fourier[bh_fidx(c,d,(int)op.th[j],0,0)];
-        const double *w=&op.w[j*(size_t)(2*c.nm)];
-        for(int m=0;m<c.nm;++m) {
-          const double wc=w[2*m],ws=w[2*m+1];
-          ff[4*m]+=wc*rv; ff[4*m+1]+=ws*rv;
-          ff[4*m+2]+=wc*iv; ff[4*m+3]+=ws*iv;
-        }
-        if(op.corr[j]>=0) {
-          const double *cw=&op.cw[(size_t)op.corr[j]*(2*c.nm)];
-          for(int m=0;m<c.nm;++m) {
-            ff[4*m+2]+=cw[2*m]*iv; ff[4*m+3]+=cw[2*m+1]*iv;
-          }
-        }
-      }
-    }
-  }
+    const BHFullDet &op=c.fullop[d];
+    double *outR=&c.local[(size_t)d*c.modes*2];
+    double *outI=outR+c.modes;
+    const size_t nc=op.raddr.size();
 
-  for(int d=0;d<c.ndet;++d) {
-    double *out=&c.local[(size_t)d*c.modes*2];
-    double r=c.radii[d];
-    for(int q=0;q<c.modes;++q) {
-      int m=c.mm[q], ma=abs(m);
-      double ss=m<0?-1.0:1.0, ar=0.0, ai=0.0;
-      const double *A=&c.thetaA[(size_t)q*c.nth], *B=&c.thetaB[(size_t)q*c.nth];
-      for(int t=0;t<c.nth;++t) {
-        const double *ff=&c.fourier[bh_fidx(c,d,t,ma,0)];
-        const double rc=ff[0], rs=ss*ff[1], ic=ff[2], is=ss*ff[3];
-        ar += A[t]*rc + B[t]*is;
-        ai += B[t]*ic - A[t]*rs;
+    for(size_t j=0;j<nc;++j) {
+      const double rv=*op.raddr[j];
+      const double iv=*op.iaddr[j];
+      const size_t base=j*(size_t)c.modes;
+      const double *__restrict crr=&op.rr[base];
+      const double *__restrict cri=&op.ri[base];
+      const double *__restrict cir=&op.ir[base];
+      const double *__restrict cii=&op.ii[base];
+
+      #pragma GCC ivdep
+      for(int q=0;q<c.modes;++q) {
+        outR[q] += crr[q]*rv + cri[q]*iv;
+        outI[q] += cir[q]*rv + cii[q]*iv;
       }
-      out[q]=ar*r;
-      out[c.modes+q]=ai*r;
     }
   }
 
