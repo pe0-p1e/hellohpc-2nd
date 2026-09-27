@@ -6,6 +6,7 @@
 #include "main.hpp"
 
 thread_local uint32 seed32_1, seed32_2;
+thread_local const std::atomic<bool>* miniclash_cancel_flag = nullptr;
 
 
 static inline __attribute__((always_inline)) bool finish_block0_candidate(
