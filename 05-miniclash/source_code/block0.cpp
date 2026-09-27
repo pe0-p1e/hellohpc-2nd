@@ -246,7 +246,6 @@ void find_block0(uint32 block[], const uint32 IV[])
 										
 					if (!(wang || stevens)) continue;
 
-					std::cout << "." << std::flush;
 
 					uint32 IV1[4], IV2[4];
 					for (int t = 0; t < 4; ++t)
@@ -268,7 +267,6 @@ void find_block0(uint32 block[], const uint32 IV[])
 							return;
 
 					if (IV2[0] != IV1[0] + (1<<31))
-						std::cout << "!" << std::flush;
 				}
 			}
 		}
