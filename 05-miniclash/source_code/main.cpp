@@ -281,12 +281,17 @@ struct batch_task
 	}
 };
 
+struct collision_payload
+{
+	uint32 msg1block0[16], msg1block1[16], msg2block0[16], msg2block1[16];
+};
+
 struct batch_attempt
 {
 	pid_t pid;
 	size_t task;
 	int cpu;
-	std::string tmp1, tmp2;
+	int result_fd;
 };
 
 bool load_batch_task(const std::string& prefix, const std::string& out1,
@@ -310,7 +315,68 @@ bool load_batch_task(const std::string& prefix, const std::string& out1,
 	return true;
 }
 
-int run_batch_attempt(const batch_task& task, int cpu, unsigned serial)
+bool write_all_fd(int fd, const void* data, size_t bytes)
+{
+	const char* p = static_cast<const char*>(data);
+	while (bytes)
+	{
+		ssize_t n = ::write(fd, p, bytes);
+		if (n < 0)
+		{
+			if (errno == EINTR) continue;
+			return false;
+		}
+		p += n;
+		bytes -= size_t(n);
+	}
+	return true;
+}
+
+bool read_all_fd(int fd, void* data, size_t bytes)
+{
+	char* p = static_cast<char*>(data);
+	while (bytes)
+	{
+		ssize_t n = ::read(fd, p, bytes);
+		if (n == 0) return false;
+		if (n < 0)
+		{
+			if (errno == EINTR) continue;
+			return false;
+		}
+		p += n;
+		bytes -= size_t(n);
+	}
+	return true;
+}
+
+bool write_batch_output(const batch_task& task, const collision_payload& payload)
+{
+	std::ofstream ofs1(task.out1.c_str(), std::ios::binary);
+	std::ofstream ofs2(task.out2.c_str(), std::ios::binary);
+	if (!ofs1 || !ofs2)
+		return false;
+	for (size_t b = 0; b < task.prefix_blocks.size(); ++b)
+	{
+		save_block(ofs1, task.prefix_blocks[b].data());
+		save_block(ofs2, task.prefix_blocks[b].data());
+	}
+	save_block(ofs1, payload.msg1block0);
+	save_block(ofs1, payload.msg1block1);
+	save_block(ofs2, payload.msg2block0);
+	save_block(ofs2, payload.msg2block1);
+	ofs1.close();
+	ofs2.close();
+	if (!ofs1 || !ofs2)
+	{
+		(void)unlink(task.out1.c_str());
+		(void)unlink(task.out2.c_str());
+		return false;
+	}
+	return true;
+}
+
+int run_batch_attempt(const batch_task& task, int cpu, unsigned serial, int result_fd)
 {
 	cpu_set_t one;
 	CPU_ZERO(&one);
@@ -326,31 +392,11 @@ int run_batch_attempt(const batch_task& task, int cpu, unsigned serial)
 	if ((seed32_1 | seed32_2) == 0)
 		seed32_2 = 1;
 
-	uint32 msg1block0[16], msg1block1[16], msg2block0[16], msg2block1[16];
-	find_collision(task.iv, msg1block0, msg1block1, msg2block0, msg2block1, false);
-
-	const std::string suffix = ".hedge-" + uint_to_string(unsigned(getppid()))
-		+ "-" + uint_to_string(serial);
-	const std::string tmp1 = task.out1 + suffix;
-	const std::string tmp2 = task.out2 + suffix;
-
-	std::ofstream ofs1(tmp1.c_str(), std::ios::binary);
-	std::ofstream ofs2(tmp2.c_str(), std::ios::binary);
-	if (!ofs1 || !ofs2)
-		return 2;
-
-	for (size_t b = 0; b < task.prefix_blocks.size(); ++b)
-	{
-		save_block(ofs1, task.prefix_blocks[b].data());
-		save_block(ofs2, task.prefix_blocks[b].data());
-	}
-	save_block(ofs1, msg1block0);
-	save_block(ofs1, msg1block1);
-	save_block(ofs2, msg2block0);
-	save_block(ofs2, msg2block1);
-	ofs1.close();
-	ofs2.close();
-	return (ofs1 && ofs2) ? 0 : 3;
+	collision_payload payload;
+	find_collision(task.iv,
+		payload.msg1block0, payload.msg1block1,
+		payload.msg2block0, payload.msg2block1, false);
+	return write_all_fd(result_fd, &payload, sizeof(payload)) ? 0 : 2;
 }
 
 int run_batch(const std::string& tasks_file)
@@ -418,25 +464,33 @@ int run_batch(const std::string& tasks_file)
 		const int cpu = free_cpus.back();
 		free_cpus.pop_back();
 		const unsigned my_serial = ++serial;
-		const std::string suffix = ".hedge-" + uint_to_string(unsigned(getpid()))
-			+ "-" + uint_to_string(my_serial);
-		const std::string tmp1 = tasks[ti].out1 + suffix;
-		const std::string tmp2 = tasks[ti].out2 + suffix;
+
+		int pipefd[2];
+		if (pipe(pipefd) != 0)
+		{
+			free_cpus.push_back(cpu);
+			return false;
+		}
 
 		pid_t pid = fork();
 		if (pid < 0)
 		{
+			close(pipefd[0]);
+			close(pipefd[1]);
 			free_cpus.push_back(cpu);
 			return false;
 		}
 		if (pid == 0)
 		{
-			const int rc = run_batch_attempt(tasks[ti], cpu, my_serial);
+			close(pipefd[0]);
+			const int rc = run_batch_attempt(tasks[ti], cpu, my_serial, pipefd[1]);
+			close(pipefd[1]);
 			_exit(rc);
 		}
+		close(pipefd[1]);
 
 		batch_attempt a;
-		a.pid = pid; a.task = ti; a.cpu = cpu; a.tmp1 = tmp1; a.tmp2 = tmp2;
+		a.pid = pid; a.task = ti; a.cpu = cpu; a.result_fd = pipefd[0];
 		active[pid] = a;
 		tasks[ti].attempts.push_back(pid);
 		return true;
@@ -454,11 +508,8 @@ int run_batch(const std::string& tasks_file)
 			int st = 0;
 			while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
 		}
-		if (cleanup)
-		{
-			(void)unlink(a.tmp1.c_str());
-			(void)unlink(a.tmp2.c_str());
-		}
+		(void)cleanup;
+		close(a.result_fd);
 		remove_pid_from_task(a.task, pid);
 		free_cpus.push_back(a.cpu);
 		active.erase(it);
@@ -524,15 +575,13 @@ int run_batch(const std::string& tasks_file)
 			continue;
 		}
 
-		if (::rename(winner.tmp1.c_str(), task.out1.c_str()) != 0
-			|| ::rename(winner.tmp2.c_str(), task.out2.c_str()) != 0)
+		collision_payload payload;
+		if (!read_all_fd(winner.result_fd, &payload, sizeof(payload))
+			|| !write_batch_output(task, payload))
 		{
-			perror("rename");
 			release_attempt(pid, true, false, true);
-			for (std::map<pid_t, batch_attempt>::const_iterator jt = active.begin();
-				jt != active.end(); ++jt)
-				(void)kill(jt->first, SIGTERM);
-			return 1;
+			fill();
+			continue;
 		}
 
 		task.done = true;
