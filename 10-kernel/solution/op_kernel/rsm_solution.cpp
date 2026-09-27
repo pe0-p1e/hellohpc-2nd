@@ -6,12 +6,17 @@ extern "C" __global__ __aicore__ void rsm_solution(
     GM_ADDR logsumexp, GM_ADDR workspace, RsmSolutionTiling tiling)
 {
     (void)workspace;
+    const uint32_t block = AscendC::GetBlockIdx();
+    if (block >= tiling.block_count) {
+        return;
+    }
+
     RsmSolution::ComputeCore core;
     core.Init(score, x, offsets, mean, rstd, logsumexp,
         tiling.n, tiling.d, tiling.epsilon);
-    const uint32_t block = AscendC::GetBlockIdx();
-    const uint32_t blocks = AscendC::GetBlockNum();
-    for (uint32_t segment = block; segment < tiling.s; segment += blocks) {
+
+    for (uint32_t segment = tiling.segment_begin[block];
+         segment < tiling.segment_end[block]; ++segment) {
         core.ProcessSegment(segment);
     }
 }
