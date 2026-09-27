@@ -15,6 +15,22 @@ extern "C" __global__ __aicore__ void rsm_solution(
     core.Init(score, x, offsets, mean, rstd, logsumexp,
         tiling.n, tiling.d, tiling.epsilon);
 
+    if (tiling.mode == 1) {
+        for (uint32_t task = block; task < tiling.task_count;
+             task += tiling.block_count) {
+            const uint32_t segment = task / tiling.shards_per_segment;
+            const uint32_t shard = task - segment * tiling.shards_per_segment;
+            const uint32_t feature_begin = shard * tiling.shard_cols;
+            const uint32_t feature_count =
+                feature_begin + tiling.shard_cols <= tiling.d
+                    ? tiling.shard_cols
+                    : tiling.d - feature_begin;
+            core.ProcessSegmentShard(
+                segment, feature_begin, feature_count);
+        }
+        return;
+    }
+
     for (uint32_t segment = tiling.segment_begin[block];
          segment < tiling.segment_end[block]; ++segment) {
         core.ProcessSegment(segment);
