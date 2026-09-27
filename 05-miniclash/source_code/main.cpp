@@ -42,12 +42,21 @@ int main()
 #include <string>
 #include <utility>
 #include <vector>
+#include <array>
+#include <map>
+#include <algorithm>
 #include <stdexcept>
 #include <stdint.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
+#include <stdio.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <sched.h>
+#include <signal.h>
+#include <unistd.h>
 
 typedef ::uint64_t uint64;
 
@@ -257,6 +266,294 @@ void parse_command_line(int argc, char** argv, options& opt,
 	}
 }
 
+
+struct batch_task
+{
+	std::vector<std::array<uint32, 16> > prefix_blocks;
+	uint32 iv[4];
+	std::string out1, out2;
+	std::vector<pid_t> attempts;
+	bool done;
+
+	batch_task(): done(false)
+	{
+		iv[0] = MD5IV[0]; iv[1] = MD5IV[1]; iv[2] = MD5IV[2]; iv[3] = MD5IV[3];
+	}
+};
+
+struct batch_attempt
+{
+	pid_t pid;
+	size_t task;
+	int cpu;
+	std::string tmp1, tmp2;
+};
+
+bool load_batch_task(const std::string& prefix, const std::string& out1,
+	const std::string& out2, batch_task& task)
+{
+	std::ifstream ifs(prefix.c_str(), std::ios::binary);
+	if (!ifs)
+		return false;
+
+	task.out1 = out1;
+	task.out2 = out2;
+	uint32 block[16];
+	while (load_block(ifs, block))
+	{
+		std::array<uint32, 16> saved;
+		for (unsigned i = 0; i < 16; ++i)
+			saved[i] = block[i];
+		task.prefix_blocks.push_back(saved);
+		md5_compress(task.iv, block);
+	}
+	return true;
+}
+
+int run_batch_attempt(const batch_task& task, int cpu, unsigned serial)
+{
+	cpu_set_t one;
+	CPU_ZERO(&one);
+	CPU_SET(cpu, &one);
+	(void)sched_setaffinity(0, sizeof(one), &one);
+
+	const uint64 mix =
+		(uint64(uint32(time(NULL))) << 32)
+		^ uint64(uint32(getpid()))
+		^ (uint64(serial) * 0x9e3779b97f4a7c15ULL);
+	seed32_1 = uint32(mix ^ (mix >> 32) ^ 0xa5a5a5a5U);
+	seed32_2 = uint32((mix >> 17) ^ (mix << 13) ^ 0x3c6ef372U);
+	if ((seed32_1 | seed32_2) == 0)
+		seed32_2 = 1;
+
+	uint32 msg1block0[16], msg1block1[16], msg2block0[16], msg2block1[16];
+	find_collision(task.iv, msg1block0, msg1block1, msg2block0, msg2block1, false);
+
+	const std::string suffix = ".hedge-" + uint_to_string(unsigned(getppid()))
+		+ "-" + uint_to_string(serial);
+	const std::string tmp1 = task.out1 + suffix;
+	const std::string tmp2 = task.out2 + suffix;
+
+	std::ofstream ofs1(tmp1.c_str(), std::ios::binary);
+	std::ofstream ofs2(tmp2.c_str(), std::ios::binary);
+	if (!ofs1 || !ofs2)
+		return 2;
+
+	for (size_t b = 0; b < task.prefix_blocks.size(); ++b)
+	{
+		save_block(ofs1, task.prefix_blocks[b].data());
+		save_block(ofs2, task.prefix_blocks[b].data());
+	}
+	save_block(ofs1, msg1block0);
+	save_block(ofs1, msg1block1);
+	save_block(ofs2, msg2block0);
+	save_block(ofs2, msg2block1);
+	ofs1.close();
+	ofs2.close();
+	return (ofs1 && ofs2) ? 0 : 3;
+}
+
+int run_batch(const std::string& tasks_file)
+{
+	std::ifstream in(tasks_file.c_str());
+	if (!in)
+	{
+		std::cerr << "cannot open task file: " << tasks_file << std::endl;
+		return 1;
+	}
+
+	std::vector<batch_task> tasks;
+	std::string line;
+	while (std::getline(in, line))
+	{
+		if (line.empty())
+			continue;
+		std::istringstream iss(line);
+		std::string prefix, out1, out2, extra;
+		if (!(iss >> prefix >> out1 >> out2) || (iss >> extra))
+		{
+			std::cerr << "malformed task line" << std::endl;
+			return 1;
+		}
+		batch_task task;
+		if (!load_batch_task(prefix, out1, out2, task))
+		{
+			std::cerr << "cannot read prefix: " << prefix << std::endl;
+			return 1;
+		}
+		tasks.push_back(task);
+	}
+	if (tasks.empty())
+		return 0;
+
+	cpu_set_t allowed;
+	CPU_ZERO(&allowed);
+	if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+	{
+		perror("sched_getaffinity");
+		return 1;
+	}
+	std::vector<int> free_cpus;
+	for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+		if (CPU_ISSET(cpu, &allowed))
+			free_cpus.push_back(cpu);
+	if (free_cpus.empty())
+		return 1;
+	if (free_cpus.size() > 32)
+		free_cpus.resize(32);
+
+	std::map<pid_t, batch_attempt> active;
+	size_t next_unique = 0;
+	size_t completed = 0;
+	unsigned serial = 0;
+
+	auto remove_pid_from_task = [&](size_t ti, pid_t pid) {
+		std::vector<pid_t>& a = tasks[ti].attempts;
+		a.erase(std::remove(a.begin(), a.end(), pid), a.end());
+	};
+
+	auto start_attempt = [&](size_t ti) -> bool {
+		if (free_cpus.empty())
+			return false;
+		const int cpu = free_cpus.back();
+		free_cpus.pop_back();
+		const unsigned my_serial = ++serial;
+		const std::string suffix = ".hedge-" + uint_to_string(unsigned(getpid()))
+			+ "-" + uint_to_string(my_serial);
+		const std::string tmp1 = tasks[ti].out1 + suffix;
+		const std::string tmp2 = tasks[ti].out2 + suffix;
+
+		pid_t pid = fork();
+		if (pid < 0)
+		{
+			free_cpus.push_back(cpu);
+			return false;
+		}
+		if (pid == 0)
+		{
+			const int rc = run_batch_attempt(tasks[ti], cpu, my_serial);
+			_exit(rc);
+		}
+
+		batch_attempt a;
+		a.pid = pid; a.task = ti; a.cpu = cpu; a.tmp1 = tmp1; a.tmp2 = tmp2;
+		active[pid] = a;
+		tasks[ti].attempts.push_back(pid);
+		return true;
+	};
+
+	auto release_attempt = [&](pid_t pid, bool already_reaped, bool kill_first, bool cleanup) {
+		std::map<pid_t, batch_attempt>::iterator it = active.find(pid);
+		if (it == active.end())
+			return;
+		const batch_attempt a = it->second;
+		if (kill_first)
+			(void)kill(pid, SIGTERM);
+		if (!already_reaped)
+		{
+			int st = 0;
+			while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+		}
+		if (cleanup)
+		{
+			(void)unlink(a.tmp1.c_str());
+			(void)unlink(a.tmp2.c_str());
+		}
+		remove_pid_from_task(a.task, pid);
+		free_cpus.push_back(a.cpu);
+		active.erase(it);
+	};
+
+	auto fill = [&]() {
+		while (!free_cpus.empty() && next_unique < tasks.size())
+		{
+			start_attempt(next_unique);
+			++next_unique;
+		}
+		if (next_unique < tasks.size())
+			return;
+
+		while (!free_cpus.empty() && completed < tasks.size())
+		{
+			size_t best = tasks.size();
+			size_t best_copies = size_t(-1);
+			for (size_t i = 0; i < tasks.size(); ++i)
+			{
+				if (tasks[i].done)
+					continue;
+				const size_t copies = tasks[i].attempts.size();
+				if (copies < best_copies)
+				{
+					best = i;
+					best_copies = copies;
+				}
+			}
+			if (best == tasks.size() || !start_attempt(best))
+				break;
+		}
+	};
+
+	fill();
+	while (completed < tasks.size())
+	{
+		int status = 0;
+		pid_t pid;
+		do { pid = waitpid(-1, &status, 0); } while (pid < 0 && errno == EINTR);
+		if (pid < 0)
+		{
+			perror("waitpid");
+			break;
+		}
+
+		std::map<pid_t, batch_attempt>::iterator it = active.find(pid);
+		if (it == active.end())
+			continue;
+		const batch_attempt winner = it->second;
+		batch_task& task = tasks[winner.task];
+
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		{
+			release_attempt(pid, true, false, true);
+			fill();
+			continue;
+		}
+		if (task.done)
+		{
+			release_attempt(pid, true, false, true);
+			fill();
+			continue;
+		}
+
+		if (std::rename(winner.tmp1.c_str(), task.out1.c_str()) != 0
+			|| std::rename(winner.tmp2.c_str(), task.out2.c_str()) != 0)
+		{
+			perror("rename");
+			release_attempt(pid, true, false, true);
+			for (std::map<pid_t, batch_attempt>::const_iterator jt = active.begin();
+				jt != active.end(); ++jt)
+				(void)kill(jt->first, SIGTERM);
+			return 1;
+		}
+
+		task.done = true;
+		++completed;
+		const std::vector<pid_t> peers = task.attempts;
+		release_attempt(pid, true, false, false);
+		for (size_t i = 0; i < peers.size(); ++i)
+			if (peers[i] != pid)
+				release_attempt(peers[i], false, true, true);
+		fill();
+	}
+
+	for (std::map<pid_t, batch_attempt>::const_iterator it = active.begin();
+		it != active.end(); ++it)
+		(void)kill(it->first, SIGTERM);
+	while (!active.empty())
+		release_attempt(active.begin()->first, false, false, true);
+
+	return completed == tasks.size() ? 0 : 1;
+}
+
 } // namespace
 
 void test_md5iv(bool single = false);
@@ -266,6 +563,9 @@ void test_all();
 
 int main(int argc, char** argv)
 {
+	if (argc == 3 && std::string(argv[1]) == "--batch")
+		return run_batch(argv[2]);
+
 	seed32_1 = uint32(time(NULL));
 	seed32_2 = 0x12345678;
 
