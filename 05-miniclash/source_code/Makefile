@@ -1,5 +1,5 @@
 CXX := g++
-CPPFLAGS := -O3 -march=native -flto -funroll-loops -fno-semantic-interposition -fno-plt
+CPPFLAGS := -O3 -std=gnu++17 -march=native -flto -fwhole-program -fipa-pta -funroll-loops -DNDEBUG -fno-semantic-interposition -fno-plt
 OBJS := block0.o block1.o block1stevens00.o block1stevens01.o block1stevens10.o block1stevens11.o block1wang.o main.o md5.o timer.o
 LIBS :=
 
