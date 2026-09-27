@@ -77,6 +77,7 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 
 	while (true) 
 	{
+		if (miniclash_cancelled()) return;
 		uint32 aa = Q[Qoff] & 0x80000000;
 		uint32 bb = 0x80000000 ^ aa;
 
@@ -228,7 +229,8 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 #define WSG(A,B,C,D,M,K,R) do{(A)=_mm512_add_epi32((A),_mm512_add_epi32(WG((B),(C),(D)),_mm512_add_epi32((M),_mm512_set1_epi32((int)(K)))));(A)=_mm512_add_epi32(_mm512_rol_epi32((A),(R)),(B));}while(0)
 #define WSH(A,B,C,D,M,K,R) do{(A)=_mm512_add_epi32((A),_mm512_add_epi32(WH((B),(C),(D)),_mm512_add_epi32((M),_mm512_set1_epi32((int)(K)))));(A)=_mm512_add_epi32(_mm512_rol_epi32((A),(R)),(B));}while(0)
 #define WSI(A,B,C,D,M,K,R) do{(A)=_mm512_add_epi32((A),_mm512_add_epi32(WI((B),(C),(D)),_mm512_add_epi32((M),_mm512_set1_epi32((int)(K)))));(A)=_mm512_add_epi32(_mm512_rol_epi32((A),(R)),(B));}while(0)
-                for(unsigned k9=0;k9<q9mask2.size();k9+=16){
+                for (unsigned k9 = 0; k9 < q9mask2.size(); k9 += 16) {
+                    if ((k9 & 255u) == 0 && miniclash_cancelled()) return;
                     __m512i q9v=_mm512_xor_si512(vq9base,_mm512_loadu_si512((const void*)(&q9mask2[k9])));
                     __m512i b12v=_mm512_sub_epi32(vtt12,q9v);
                     __m512i b8v=_mm512_sub_epi32(_mm512_ror_epi32(_mm512_sub_epi32(q9v,vq8),7),vtt8);
