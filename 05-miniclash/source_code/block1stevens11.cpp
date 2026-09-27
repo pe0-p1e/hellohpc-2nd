@@ -73,6 +73,7 @@ void find_block1_stevens_11(uint32 block[], const uint32 IV[])
 
 	while (true) 
 	{
+		if (miniclash_cancelled()) return;
 		uint32 aa = Q[Qoff] & 0x80000000;
 
 		Q[Qoff + 2] = (xrng64() & 0x75bef63e) | 0x0a410041 | aa;
@@ -227,6 +228,7 @@ void find_block1_stevens_11(uint32 block[], const uint32 IV[])
 #define SSTEP_I(A,B,C,D,M,K,R) do { (A)=_mm512_add_epi32((A),_mm512_add_epi32(SI((B),(C),(D)),_mm512_add_epi32((M),_mm512_set1_epi32((int)(K))))); (A)=_mm512_add_epi32(_mm512_rol_epi32((A),(R)),(B)); } while(0)
 
             for (unsigned k9 = 0; k9 < q9mask.size(); k9 += 16) {
+                    if ((k9 & 255u) == 0 && miniclash_cancelled()) return;
                 __m512i q9v = _mm512_xor_si512(vq9base,
                     _mm512_loadu_si512((const void*)(&q9mask[k9])));
                 __m512i b12v = _mm512_sub_epi32(vtt12, q9v);
