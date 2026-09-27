@@ -64,13 +64,16 @@ struct BHFourierKeyHash {
     return h ^ (size_t(k.th)*0xbf58476d1ce4e5b9ULL);
   }
 };
+struct BHFourierCorr {
+  double dc[2*ghost_width+4];
+  double ds[2*ghost_width+4];
+};
 struct BHFourierRow {
   Block *b;
   int idx, th;
+  int corr;
   double wc[2*ghost_width+4];
   double ws[2*ghost_width+4];
-  double wic[2*ghost_width+4];
-  double wis[2*ghost_width+4];
 };
 
 struct BHFastCache {
@@ -83,6 +86,7 @@ struct BHFastCache {
   std::vector<BHFastPoint> pts;
   std::vector<Block*> local_blocks;
   std::vector<std::vector<BHFourierRow> > fop;
+  std::vector<std::vector<BHFourierCorr> > fcorr;
   std::vector<double> fourier, local, global;
   BHFastCache():configured(false),ready(false),valid(false),lev(-1),maxl(0),
     modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
@@ -345,24 +349,14 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.global.assign((size_t)c.ndet*c.modes*2,0.0);
 
   // Precompute sparse grid -> (theta, |m|) Fourier operator.
-  // This retains the cheap theta->(l,m) projection while removing all timed interpolation.
-  c.fop.clear();
-  c.fop.resize(c.ndet);
+  // R and I share weights except for reflected-z stencil terms.
+  c.fop.clear(); c.fop.resize(c.ndet);
+  c.fcorr.clear(); c.fcorr.resize(c.ndet);
   for(int d=0; d<c.ndet; ++d) {
+    std::unordered_map<BHFourierKey,int,BHFourierKeyHash> ids;
     std::vector<BHFourierRow> &rows=c.fop[d];
-
-    // Direct dense id tables replace millions of unordered_map lookups during
-    // warmup.  The table is detector-local and freed before the next detector.
-    std::vector<std::vector<int> > ids(c.local_blocks.size());
-    for(size_t bi=0; bi<c.local_blocks.size(); ++bi) {
-      Block *b=c.local_blocks[bi];
-      const size_t nc=(size_t)b->shape[0]*b->shape[1]*b->shape[2];
-      ids[bi].assign(nc*c.nth,-1);
-    }
-
-    size_t detector_points=0;
-    for(size_t pp=0; pp<c.pts.size(); ++pp) if(c.pts[pp].det==d) ++detector_points;
-    rows.reserve(detector_points * c.ord);
+    std::vector<BHFourierCorr> &corrs=c.fcorr[d];
+    ids.reserve(c.pts.size()/c.ndet * c.ord + 64);
 
     for(size_t pp=0; pp<c.pts.size(); ++pp) {
       const BHFastPoint &p=c.pts[pp];
@@ -370,35 +364,48 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
       const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
       const size_t tr=(size_t)p.ph*c.nm;
-      std::vector<int> &idtab=ids[p.bid];
 
       for(int iz=0; iz<c.ord; ++iz) {
         const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
+        const double idelta=izsgn-1.0;
         for(int iy=0; iy<c.ord; ++iy) {
           const double wyz=wy[iy]*wz[iz];
           for(int ix=0; ix<c.ord; ++ix) {
-            const double wR=wx[ix]*wyz;
-            const double wI=wR*izsgn;
-            const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
-            const size_t slot=(size_t)at*c.nth+p.th;
-            int id=idtab[slot];
-            if(id<0) {
+            const double w=wx[ix]*wyz;
+            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            BHFourierKey key={p.b,at,p.th};
+            int id;
+            std::unordered_map<BHFourierKey,int,BHFourierKeyHash>::iterator it=ids.find(key);
+            if(it==ids.end()) {
               id=(int)rows.size();
-              idtab[slot]=id;
+              ids.insert(std::make_pair(key,id));
               BHFourierRow row;
-              row.b=p.b; row.idx=at; row.th=p.th;
-              for(int m=0;m<(int)(2*ghost_width+4);++m)
-                row.wc[m]=row.ws[m]=row.wic[m]=row.wis[m]=0.0;
+              row.b=p.b; row.idx=at; row.th=p.th; row.corr=-1;
+              for(int m=0;m<(int)(2*ghost_width+4);++m) row.wc[m]=row.ws[m]=0.0;
               rows.push_back(row);
-            }
+            } else id=it->second;
 
             BHFourierRow &row=rows[id];
             for(int m=0;m<c.nm;++m) {
               const double cs=c.cphi[tr+m], sn=c.sphi[tr+m];
-              row.wc[m]  += wR*cs;
-              row.ws[m]  += wR*sn;
-              row.wic[m] += wI*cs;
-              row.wis[m] += wI*sn;
+              row.wc[m] += w*cs;
+              row.ws[m] += w*sn;
+            }
+
+            if(idelta!=0.0) {
+              if(row.corr<0) {
+                row.corr=(int)corrs.size();
+                BHFourierCorr cc;
+                for(int m=0;m<(int)(2*ghost_width+4);++m) cc.dc[m]=cc.ds[m]=0.0;
+                corrs.push_back(cc);
+              }
+              BHFourierCorr &cc=corrs[row.corr];
+              const double dw=w*idelta;
+              for(int m=0;m<c.nm;++m) {
+                const double cs=c.cphi[tr+m], sn=c.sphi[tr+m];
+                cc.dc[m] += dw*cs;
+                cc.ds[m] += dw*sn;
+              }
             }
           }
         }
@@ -412,22 +419,57 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.valid=true;return true;
 }
 
+template<int NM>
+static inline void bh_fourier_rows_fixed(BHFastCache &c,int d,var *rp,var *ip) {
+  const std::vector<BHFourierRow> &rows=c.fop[d];
+  const std::vector<BHFourierCorr> &corrs=c.fcorr[d];
+  for(size_t j=0;j<rows.size();++j) {
+    const BHFourierRow &row=rows[j];
+    const double rv=row.b->fgfs[rp->sgfn][row.idx];
+    const double iv=row.b->fgfs[ip->sgfn][row.idx];
+    double *f=&c.fourier[bh_fidx(c,d,row.th,0,0)];
+    for(int m=0;m<NM;++m) {
+      f[4*m+0] += row.wc[m]*rv;
+      f[4*m+1] += row.ws[m]*rv;
+      f[4*m+2] += row.wc[m]*iv;
+      f[4*m+3] += row.ws[m]*iv;
+    }
+    if(row.corr>=0) {
+      const BHFourierCorr &cc=corrs[row.corr];
+      for(int m=0;m<NM;++m) {
+        f[4*m+2] += cc.dc[m]*iv;
+        f[4*m+3] += cc.ds[m]*iv;
+      }
+    }
+  }
+}
+
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   std::fill(c.fourier.begin(),c.fourier.end(),0.0);
   std::fill(c.local.begin(),c.local.end(),0.0);
 
   for(int d=0; d<c.ndet; ++d) {
-    const std::vector<BHFourierRow> &rows=c.fop[d];
-    for(size_t j=0;j<rows.size();++j) {
-      const BHFourierRow &row=rows[j];
-      const double rv=row.b->fgfs[rp->sgfn][row.idx];
-      const double iv=row.b->fgfs[ip->sgfn][row.idx];
-      double *f=&c.fourier[bh_fidx(c,d,row.th,0,0)];
-      for(int m=0;m<c.nm;++m) {
-        f[4*m+0] += row.wc[m]*rv;
-        f[4*m+1] += row.ws[m]*rv;
-        f[4*m+2] += row.wic[m]*iv;
-        f[4*m+3] += row.wis[m]*iv;
+    if(c.nm==5) bh_fourier_rows_fixed<5>(c,d,rp,ip);
+    else if(c.nm==8) bh_fourier_rows_fixed<8>(c,d,rp,ip);
+    else if(c.nm==10) bh_fourier_rows_fixed<10>(c,d,rp,ip);
+    else {
+      const std::vector<BHFourierRow> &rows=c.fop[d];
+      const std::vector<BHFourierCorr> &corrs=c.fcorr[d];
+      for(size_t j=0;j<rows.size();++j) {
+        const BHFourierRow &row=rows[j];
+        const double rv=row.b->fgfs[rp->sgfn][row.idx];
+        const double iv=row.b->fgfs[ip->sgfn][row.idx];
+        double *ff=&c.fourier[bh_fidx(c,d,row.th,0,0)];
+        for(int m=0;m<c.nm;++m) {
+          ff[4*m+0]+=row.wc[m]*rv; ff[4*m+1]+=row.ws[m]*rv;
+          ff[4*m+2]+=row.wc[m]*iv; ff[4*m+3]+=row.ws[m]*iv;
+        }
+        if(row.corr>=0) {
+          const BHFourierCorr &cc=corrs[row.corr];
+          for(int m=0;m<c.nm;++m) {
+            ff[4*m+2]+=cc.dc[m]*iv; ff[4*m+3]+=cc.ds[m]*iv;
+          }
+        }
       }
     }
   }
@@ -440,8 +482,8 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
       double ss=m<0?-1.0:1.0, ar=0.0, ai=0.0;
       const double *A=&c.thetaA[(size_t)q*c.nth], *B=&c.thetaB[(size_t)q*c.nth];
       for(int t=0;t<c.nth;++t) {
-        const double *f=&c.fourier[bh_fidx(c,d,t,ma,0)];
-        const double rc=f[0], rs=ss*f[1], ic=f[2], is=ss*f[3];
+        const double *ff=&c.fourier[bh_fidx(c,d,t,ma,0)];
+        const double rc=ff[0], rs=ss*ff[1], ic=ff[2], is=ss*ff[3];
         ar += A[t]*rc + B[t]*is;
         ai += B[t]*ic - A[t]*rs;
       }
