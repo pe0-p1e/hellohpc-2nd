@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,8 @@
 #include <string_view>
 #include <tuple>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace maimoe::kernel {
 namespace {
@@ -196,8 +199,33 @@ struct SourceState {
     std::uint32_t active_end = 0;
 };
 
+struct CompactEvent {
+    EventType type = EventType::Tap;
+    std::uint32_t tick = 0;
+    std::uint32_t end_tick = 0;
+    std::uint8_t lane = 0;
+    std::uint8_t target_lane = 0;
+    std::uint8_t touch_sensor = 0;
+    std::uint8_t strength = 0;
+    std::uint8_t path_id = 0;
+    SourceLocation location{};
+    std::uint64_t word = 0;
+};
+
+struct FastMetadata {
+    std::uint32_t whole_bpm_milli = 120000U;
+};
+
+struct FastChart {
+    FastMetadata metadata;
+    std::vector<CompactEvent> events;
+    Counts counts;
+    std::uint32_t warning_count = 0;
+    std::uint32_t max_tick = 0;
+};
+
 struct FastParser {
-    ParsedChart chart;
+    FastChart chart;
     std::uint64_t tick = 0;
     std::uint32_t division = 4;
     std::uint32_t bpm_milli = 0;
@@ -335,7 +363,7 @@ inline void append_touch_name(char*& cursor, std::uint8_t sensor) noexcept {
     }
 }
 
-[[nodiscard]] bool set_canonical_fast(Event& event) {
+[[nodiscard]] bool set_event_word_fast(CompactEvent& event) {
     std::array<char, 96> buffer{};
     char* cursor = buffer.data();
     char* const end = buffer.data() + buffer.size();
@@ -392,8 +420,8 @@ inline void append_touch_name(char*& cursor, std::uint8_t sensor) noexcept {
             break;
     }
 
-    event.canonical.assign(buffer.data(),
-                           static_cast<std::size_t>(cursor - buffer.data()));
+    event.word = event_word(std::string_view(
+        buffer.data(), static_cast<std::size_t>(cursor - buffer.data())));
     return true;
 }
 
@@ -450,7 +478,7 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
         return false;
     }
 
-    Event event;
+    CompactEvent event;
     event.tick = static_cast<std::uint32_t>(parser.tick);
     event.location.byte_offset = byte_offset;
 
@@ -546,7 +574,7 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
     if (parser.parsed_events > kMaxEvents) {
         return false;
     }
-    if (!set_canonical_fast(event)) {
+    if (!set_event_word_fast(event)) {
         return false;
     }
     parser.chart.events.push_back(std::move(event));
@@ -702,7 +730,7 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
 }
 
 [[nodiscard]] bool fast_parse_valid(std::string_view text,
-                                    ParsedChart& output) {
+                                    FastChart& output) {
     if (text.empty() || text.size() > kMaxChartBytes ||
         text.back() != '\n') {
         return false;
@@ -792,11 +820,11 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
     }
 
     parser.chart.counts.warning = parser.warning_count;
-    parser.chart.warnings.resize(parser.warning_count);
+    parser.chart.warning_count = parser.warning_count;
 
     std::sort(
         parser.chart.events.begin(), parser.chart.events.end(),
-        [](const Event& lhs, const Event& rhs) {
+        [](const CompactEvent& lhs, const CompactEvent& rhs) {
             return std::tuple(
                        lhs.tick, static_cast<std::uint8_t>(lhs.type),
                        lhs.location.byte_offset) <
@@ -809,6 +837,215 @@ inline void increment_count_fast(Counts& counts, EventType type) noexcept {
     return true;
 }
 
+
+constexpr std::uint64_t kStateMixMultiplier = 0xd6e8feb86659fd93ULL;
+constexpr std::uint64_t kStateMixIncrement = 0xa5a3564e27f8862fULL;
+
+inline void add_button_energy_fast(
+    State& state, std::uint8_t lane, std::uint32_t value) noexcept {
+    if (lane >= state.energy.size()) {
+        return;
+    }
+    state.energy[lane] = static_cast<std::uint16_t>(
+        std::min<std::uint32_t>(
+            65535U,
+            static_cast<std::uint32_t>(state.energy[lane]) + value));
+}
+
+inline void add_touch_energy_fast(
+    State& state, std::uint8_t sensor, std::uint32_t value) noexcept {
+    if (sensor >= state.touch_energy.size()) {
+        return;
+    }
+    state.touch_energy[sensor] = static_cast<std::uint16_t>(
+        std::min<std::uint32_t>(
+            65535U,
+            static_cast<std::uint32_t>(state.touch_energy[sensor]) + value));
+}
+
+inline void apply_compact_event(
+    State& state, const CompactEvent& event) noexcept {
+    switch (event.type) {
+        case EventType::Tap:
+            if (event.lane < state.energy.size()) {
+                add_button_energy_fast(state, event.lane, event.strength);
+                state.taps[event.lane] = LatestTap{true, event.strength};
+            }
+            break;
+        case EventType::Hold:
+            if (event.lane < state.energy.size()) {
+                add_button_energy_fast(
+                    state, event.lane,
+                    std::max<std::uint32_t>(1U, event.strength / 4U));
+                state.holds[event.lane] =
+                    ActiveHold{true, event.end_tick, event.strength};
+            }
+            break;
+        case EventType::Slide:
+            if (event.lane < state.energy.size() &&
+                event.target_lane < state.energy.size()) {
+                const std::uint32_t distance =
+                    event.target_lane > event.lane
+                        ? event.target_lane - event.lane
+                        : event.lane - event.target_lane;
+                add_button_energy_fast(
+                    state, event.lane, 8U * (distance + 1U));
+                state.slides[event.lane] = ActiveSlide{
+                    true, event.end_tick, event.target_lane, event.path_id};
+            }
+            break;
+        case EventType::Break:
+            if (event.lane < state.energy.size()) {
+                add_button_energy_fast(
+                    state, event.lane, 2U * event.strength);
+                state.breaks[event.lane] =
+                    LatestBreak{true, event.strength, 3};
+                state.break_remaining = 3;
+            }
+            break;
+        case EventType::TouchTap:
+            if (event.touch_sensor < state.touch_energy.size()) {
+                add_touch_energy_fast(
+                    state, event.touch_sensor, event.strength);
+                state.touches[event.touch_sensor] =
+                    LatestTouch{true, false, event.strength};
+            }
+            break;
+        case EventType::TouchHold:
+            if (event.touch_sensor < state.touch_energy.size()) {
+                add_touch_energy_fast(
+                    state, event.touch_sensor,
+                    std::max<std::uint32_t>(1U, event.strength / 4U));
+                state.touch_holds[event.touch_sensor] =
+                    ActiveTouchHold{true, event.end_tick, event.strength};
+                state.touches[event.touch_sensor] =
+                    LatestTouch{true, true, event.strength};
+            }
+            break;
+    }
+
+    state.phase =
+        std::rotl(state.phase ^ event.word, 13) *
+            kStateMixMultiplier +
+        kStateMixIncrement;
+}
+
+[[nodiscard]] EndpointStates evolve_compact_states(
+    std::uint64_t chart_id, const FastChart& chart) {
+    EndpointStates endpoints;
+    State current;
+
+    const std::uint64_t bpm_q16 =
+        (static_cast<std::uint64_t>(chart.metadata.whole_bpm_milli) *
+             65536ULL +
+         500ULL) /
+        1000ULL;
+    current.phase =
+        0x6a09e667f3bcc909ULL ^ chart_id ^ (bpm_q16 << 17U) ^
+        static_cast<std::uint64_t>(kTouchSensorCount);
+    current.warning_count = chart.warning_count;
+    if (chart.warning_count != 0U) {
+        current.latest_warning_severity = 1U;
+    }
+
+    std::size_t next_event = 0U;
+    while (next_event < chart.events.size() &&
+           chart.events[next_event].tick == 0U) {
+        apply_compact_event(current, chart.events[next_event]);
+        ++next_event;
+    }
+    endpoints.frame_begin = current;
+
+    for (std::size_t frame = 0U; frame + 1U < kFrameCount; ++frame) {
+        State next = current;
+        const std::uint32_t target_tick =
+            frame_tick(chart.max_tick, frame + 1U);
+
+        for (std::size_t lane = 0U; lane < next.energy.size(); ++lane) {
+            next.energy[lane] = static_cast<std::uint16_t>(
+                (7U * static_cast<std::uint32_t>(next.energy[lane])) / 8U);
+
+            if (current.holds[lane].present) {
+                add_button_energy_fast(
+                    next, static_cast<std::uint8_t>(lane),
+                    std::max<std::uint32_t>(
+                        1U, current.holds[lane].strength / 8U));
+            }
+            if (current.slides[lane].present) {
+                const std::uint8_t target =
+                    current.slides[lane].target_lane;
+                const std::uint32_t distance =
+                    target > lane
+                        ? target - static_cast<std::uint32_t>(lane)
+                        : static_cast<std::uint32_t>(lane) - target;
+                add_button_energy_fast(
+                    next, static_cast<std::uint8_t>(lane),
+                    4U * (distance + 1U));
+            }
+        }
+
+        for (std::size_t sensor = 0U;
+             sensor < next.touch_energy.size(); ++sensor) {
+            next.touch_energy[sensor] = static_cast<std::uint16_t>(
+                (7U * static_cast<std::uint32_t>(
+                          next.touch_energy[sensor])) /
+                8U);
+            if (current.touch_holds[sensor].present) {
+                add_touch_energy_fast(
+                    next, static_cast<std::uint8_t>(sensor),
+                    std::max<std::uint32_t>(
+                        1U,
+                        current.touch_holds[sensor].strength / 8U));
+            }
+        }
+
+        if (next.break_remaining > 0U) {
+            --next.break_remaining;
+        }
+        for (LatestBreak& note_break : next.breaks) {
+            if (note_break.flash_frames > 0U) {
+                --note_break.flash_frames;
+            }
+        }
+        for (std::size_t lane = 0U;
+             lane < next.holds.size(); ++lane) {
+            if (next.holds[lane].present &&
+                next.holds[lane].end_tick <= target_tick) {
+                next.holds[lane] = ActiveHold{};
+            }
+            if (next.slides[lane].present &&
+                next.slides[lane].end_tick <= target_tick) {
+                next.slides[lane] = ActiveSlide{};
+            }
+        }
+        for (ActiveTouchHold& hold : next.touch_holds) {
+            if (hold.present && hold.end_tick <= target_tick) {
+                hold = ActiveTouchHold{};
+            }
+        }
+
+        next.phase =
+            std::rotl(
+                next.phase ^ static_cast<std::uint64_t>(frame + 1U),
+                7) *
+                kStateMixMultiplier +
+            kStateMixIncrement;
+
+        while (next_event < chart.events.size() &&
+               chart.events[next_event].tick <= target_tick) {
+            apply_compact_event(next, chart.events[next_event]);
+            ++next_event;
+        }
+
+        current = std::move(next);
+        if (frame + 1U == kLastSampleFrame) {
+            endpoints.frame_end = current;
+        }
+    }
+
+    return endpoints;
+}
+
 }  // namespace
 
 #if defined(__GNUC__)
@@ -818,9 +1055,11 @@ void process_chart(
     std::uint64_t chart_id,
     std::string_view chart_text,
     std::span<std::uint8_t, kEncodedChartBytes> output) {
-    ParsedChart chart;
-    if (!fast_parse_valid(chart_text, chart)) [[unlikely]] {
-        chart = parse_maidata(chart_text);
+    FastChart fast_chart;
+    ParsedChart parsed_chart;
+    const bool fast = fast_parse_valid(chart_text, fast_chart);
+    if (!fast) [[unlikely]] {
+        parsed_chart = parse_maidata(chart_text);
     }
 
     auto begin_payload = std::span<std::uint8_t, kOutputFramePayloadBytes>(
@@ -837,8 +1076,10 @@ void process_chart(
     std::array<std::uint8_t, 16> error_fields{};
     const std::uint8_t* result_error_fields = nullptr;
 
-    if (const SemanticError* error = select_semantic_error(chart);
-        error != nullptr) [[unlikely]] {
+    const SemanticError* error =
+        fast ? nullptr : select_semantic_error(parsed_chart);
+
+    if (error != nullptr) [[unlikely]] {
         status = engine::ResultStatus::Error;
         error_fields = canonical_error_fields(*error);
         result_error_fields = error_fields.data();
@@ -861,13 +1102,27 @@ void process_chart(
             std::span<const std::uint8_t, 16>(error_fields),
             begin_digest, end_digest);
     } else [[likely]] {
-        counts = chart.counts;
-        const EndpointStates states = evolve_endpoint_states(chart_id, chart);
+        EndpointStates states;
+        ParsedChart render_stub;
+        const ParsedChart* render_chart = nullptr;
+
+        if (fast) [[likely]] {
+            counts = fast_chart.counts;
+            states = evolve_compact_states(chart_id, fast_chart);
+            render_stub.max_tick = fast_chart.max_tick;
+            render_chart = &render_stub;
+        } else {
+            counts = parsed_chart.counts;
+            states = evolve_endpoint_states(chart_id, parsed_chart);
+            render_chart = &parsed_chart;
+        }
 
         render_output_rgba_into(
-            chart_id, chart, states.frame_begin, kFirstSampleFrame, begin_payload);
+            chart_id, *render_chart, states.frame_begin,
+            kFirstSampleFrame, begin_payload);
         render_output_rgba_into(
-            chart_id, chart, states.frame_end, kLastSampleFrame, end_payload);
+            chart_id, *render_chart, states.frame_end,
+            kLastSampleFrame, end_payload);
 
         std::array<std::uint8_t, kSerializedStateBytes> serialized_state{};
         serialize_state_into(states.frame_end, serialized_state);
@@ -877,11 +1132,13 @@ void process_chart(
         end_digest = sha256(std::span<const std::uint8_t>(
             end_payload.data(), end_payload.size()));
         result_digest = valid_result_digest(
-            chart_id, counts, serialized_state, begin_digest, end_digest);
+            chart_id, counts, serialized_state,
+            begin_digest, end_digest);
     }
 
     write_frame_header(
-        output.data(), chart_id, FrameRole::Begin, status, begin_digest);
+        output.data(), chart_id, FrameRole::Begin,
+        status, begin_digest);
     write_frame_header(
         output.data() + kOutputFrameFileBytes,
         chart_id, FrameRole::End, status, end_digest);
