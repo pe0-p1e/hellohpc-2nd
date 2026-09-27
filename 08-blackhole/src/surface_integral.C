@@ -555,6 +555,8 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
 
     c.pts.clear();
     c.pts.shrink_to_fit();
+    c.fourier.clear();
+    c.fourier.shrink_to_fit();
   }
   c.valid=true;return true;
 }
@@ -604,8 +606,10 @@ static inline void bh_eval_medium21_avx512(const BHFullDet &op,
 #endif
 
 template<int NM>
-static inline void bh_fourier_theta_grouped(BHFastCache &c,int d) {
+static inline void bh_fourier_project_grouped(BHFastCache &c,int d,
+                                               double *outR,double *outI) {
   const BHFourierOp &op=c.fop[d];
+  const double radius=c.radii[d];
 
   for(int t=0;t<c.nth;++t) {
     const size_t beg=op.theta_begin[t], end=op.theta_begin[t+1];
@@ -638,19 +642,23 @@ static inline void bh_fourier_theta_grouped(BHFastCache &c,int d) {
       }
     }
 
-    double *ff=&c.fourier[bh_fidx(c,d,t,0,0)];
-    for(int m=0;m<NM;++m) {
-      ff[4*m]=rc[m];
-      ff[4*m+1]=rs[m];
-      ff[4*m+2]=ic[m];
-      ff[4*m+3]=is[m];
+    for(int q=0;q<c.modes;++q) {
+      const int m=c.mm[q], ma=abs(m);
+      const double ss=m<0?-1.0:1.0;
+      const double A=c.thetaA[(size_t)q*c.nth+t];
+      const double B=c.thetaB[(size_t)q*c.nth+t];
+      outR[q] += radius*(A*rc[ma] + B*(ss*is[ma]));
+      outI[q] += radius*(B*ic[ma] - A*(ss*rs[ma]));
     }
   }
 }
 
 #ifdef __AVX512F__
-static inline void bh_fourier_theta8_avx512(BHFastCache &c,int d) {
+static inline void bh_fourier_project8_avx512(BHFastCache &c,int d,
+                                               double *outR,double *outI) {
   const BHFourierOp &op=c.fop[d];
+  const double radius=c.radii[d];
+
   for(int t=0;t<c.nth;++t) {
     const size_t beg=op.theta_begin[t],end=op.theta_begin[t+1];
     if(beg==end) continue;
@@ -661,7 +669,6 @@ static inline void bh_fourier_theta8_avx512(BHFastCache &c,int d) {
     for(size_t j=beg;j<end;++j) {
       const __m512d rv=_mm512_set1_pd(*op.raddr[j]);
       const __m512d iv=_mm512_set1_pd(*op.iaddr[j]);
-
       const __m512d wc=_mm512_loadu_pd(&op.wc[j*8u]);
       const __m512d ws=_mm512_loadu_pd(&op.ws[j*8u]);
 
@@ -677,12 +684,17 @@ static inline void bh_fourier_theta8_avx512(BHFastCache &c,int d) {
       }
     }
 
-    alignas(64) double a[8],b[8],cc[8],dd[8];
-    _mm512_store_pd(a,rc); _mm512_store_pd(b,rs);
-    _mm512_store_pd(cc,ic); _mm512_store_pd(dd,is);
-    double *ff=&c.fourier[bh_fidx(c,d,t,0,0)];
-    for(int m=0;m<8;++m){
-      ff[4*m]=a[m]; ff[4*m+1]=b[m]; ff[4*m+2]=cc[m]; ff[4*m+3]=dd[m];
+    alignas(64) double rca[8],rsa[8],ica[8],isa[8];
+    _mm512_store_pd(rca,rc); _mm512_store_pd(rsa,rs);
+    _mm512_store_pd(ica,ic); _mm512_store_pd(isa,is);
+
+    for(int q=0;q<c.modes;++q) {
+      const int m=c.mm[q],ma=abs(m);
+      const double ss=m<0?-1.0:1.0;
+      const double A=c.thetaA[(size_t)q*c.nth+t];
+      const double B=c.thetaB[(size_t)q*c.nth+t];
+      outR[q] += radius*(A*rca[ma] + B*(ss*isa[ma]));
+      outI[q] += radius*(B*ica[ma] - A*(ss*rsa[ma]));
     }
   }
 }
@@ -721,57 +733,48 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
       }
     }
   } else {
-    std::fill(c.fourier.begin(),c.fourier.end(),0.0);
     std::fill(c.local.begin(),c.local.end(),0.0);
 
-    for(int d=0; d<c.ndet; ++d) {
+    for(int d=0;d<c.ndet;++d) {
+      double *outR=&c.local[(size_t)d*c.modes*2];
+      double *outI=outR+c.modes;
 #ifdef __AVX512F__
-      if(c.nm==8) bh_fourier_theta8_avx512(c,d);
+      if(c.nm==8) bh_fourier_project8_avx512(c,d,outR,outI);
       else
 #endif
-      if(c.nm==8) bh_fourier_theta_grouped<8>(c,d);
-      else if(c.nm==10) bh_fourier_theta_grouped<10>(c,d);
+      if(c.nm==8) bh_fourier_project_grouped<8>(c,d,outR,outI);
+      else if(c.nm==10) bh_fourier_project_grouped<10>(c,d,outR,outI);
       else {
+        // Generic high-mode fallback (not used by current benchmark configs).
         const BHFourierOp &op=c.fop[d];
-        for(size_t j=0;j<op.th.size();++j) {
-          const double rv=*op.raddr[j],iv=*op.iaddr[j];
-          double *ff=&c.fourier[bh_fidx(c,d,(int)op.th[j],0,0)];
-          const double *w=&op.wc[j*(size_t)(2*c.nm)];
-          for(int m=0;m<c.nm;++m) {
-            const double wc=w[2*m],ws=w[2*m+1];
-            ff[4*m]+=wc*rv; ff[4*m+1]+=ws*rv;
-            ff[4*m+2]+=wc*iv; ff[4*m+3]+=ws*iv;
-          }
-          if(op.corr[j]>=0) {
-            const double *cw=&op.cwc[(size_t)op.corr[j]*(2*c.nm)];
+        const double radius=c.radii[d];
+        for(int t=0;t<c.nth;++t) {
+          const size_t beg=op.theta_begin[t],end=op.theta_begin[t+1];
+          std::vector<double> rc(c.nm,0.0),rs(c.nm,0.0),ic(c.nm,0.0),is(c.nm,0.0);
+          for(size_t j=beg;j<end;++j) {
+            const double rv=*op.raddr[j],iv=*op.iaddr[j];
+            const double *wc=&op.wc[j*(size_t)c.nm],*ws=&op.ws[j*(size_t)c.nm];
             for(int m=0;m<c.nm;++m) {
-              ff[4*m+2]+=cw[2*m]*iv;
-              ff[4*m+3]+=cw[2*m+1]*iv;
+              rc[m]+=wc[m]*rv; rs[m]+=ws[m]*rv;
+              ic[m]+=wc[m]*iv; is[m]+=ws[m]*iv;
+            }
+            if(op.corr[j]>=0) {
+              const double *cc=&op.cwc[(size_t)op.corr[j]*c.nm];
+              const double *cs=&op.cws[(size_t)op.corr[j]*c.nm];
+              for(int m=0;m<c.nm;++m){ic[m]+=cc[m]*iv;is[m]+=cs[m]*iv;}
             }
           }
+          for(int q=0;q<c.modes;++q) {
+            const int m=c.mm[q],ma=abs(m); const double ss=m<0?-1.0:1.0;
+            const double A=c.thetaA[(size_t)q*c.nth+t],B=c.thetaB[(size_t)q*c.nth+t];
+            outR[q]+=radius*(A*rc[ma]+B*(ss*is[ma]));
+            outI[q]+=radius*(B*ic[ma]-A*(ss*rs[ma]));
+          }
         }
-      }
-    }
-
-    for(int d=0;d<c.ndet;++d) {
-      double *out=&c.local[(size_t)d*c.modes*2];
-      const double r=c.radii[d];
-      for(int q=0;q<c.modes;++q) {
-        const int m=c.mm[q],ma=abs(m);
-        const double ss=m<0?-1.0:1.0;
-        double ar=0.0,ai=0.0;
-        const double *A=&c.thetaA[(size_t)q*c.nth],*B=&c.thetaB[(size_t)q*c.nth];
-        for(int t=0;t<c.nth;++t) {
-          const double *ff=&c.fourier[bh_fidx(c,d,t,ma,0)];
-          const double rc=ff[0],rs=ss*ff[1],ic=ff[2],is=ss*ff[3];
-          ar+=A[t]*rc+B[t]*is;
-          ai+=B[t]*ic-A[t]*rs;
-        }
-        out[q]=ar*r;
-        out[c.modes+q]=ai*r;
       }
     }
   }
+
 
 
   MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),
