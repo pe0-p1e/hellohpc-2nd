@@ -82,6 +82,19 @@ public:
         StoreResults(segment, maximum, normalizer);
     }
 
+    __aicore__ inline void ProcessSegmentShard(
+        uint32_t segment, uint32_t feature_begin, uint32_t feature_count)
+    {
+        const uint32_t begin = static_cast<uint32_t>(offsets_gm_.GetValue(segment));
+        const uint32_t end = static_cast<uint32_t>(offsets_gm_.GetValue(segment + 1));
+        const float maximum = SegmentMaximum(begin, end);
+        const float normalizer = AccumulateShardMoments(
+            begin, end, maximum, feature_begin, feature_count);
+        FinalizeMomentsCount(normalizer, feature_count);
+        StoreShardResults(
+            segment, feature_begin, feature_count, maximum, normalizer);
+    }
+
 private:
     __aicore__ inline uint32_t Minimum(uint32_t lhs, uint32_t rhs) const
     {
@@ -119,6 +132,24 @@ private:
         const uint16_t bytes = static_cast<uint16_t>(elements * sizeof(half));
         auto x_half = x_half_buffer_.Get<half>();
         AscendC::DataCopyPad(x_half, x_gm_[begin * d_], {1, bytes, 0, 0}, {});
+        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::Cast(
+            x_float_buffer_.Get<float>(), x_half,
+            AscendC::RoundMode::CAST_NONE, elements);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void LoadRowsShard(
+        uint32_t begin, uint32_t rows, uint32_t feature_begin,
+        uint32_t feature_count)
+    {
+        const uint32_t elements = rows * feature_count;
+        const uint32_t block_bytes = feature_count * sizeof(half);
+        const uint32_t source_gap = (d_ - feature_count) * sizeof(half);
+        auto x_half = x_half_buffer_.Get<half>();
+        AscendC::DataCopyPad(
+            x_half, x_gm_[begin * d_ + feature_begin],
+            {static_cast<uint16_t>(rows), block_bytes, source_gap, 0}, {});
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::Cast(
             x_float_buffer_.Get<float>(), x_half,
@@ -504,6 +535,185 @@ private:
                 AscendC::PipeBarrier<PIPE_V>();
             }
         }
+    }
+
+    __aicore__ inline float AccumulateShardMoments(
+        uint32_t begin, uint32_t end, float maximum,
+        uint32_t feature_begin, uint32_t feature_count)
+    {
+        auto sum = mean_buffer_.Get<float>();
+        auto correction = mean_correction_buffer_.Get<float>();
+        auto term = temp_buffer_.Get<float>();
+        auto delta = delta_buffer_.Get<float>();
+        auto x_float = x_float_buffer_.Get<float>();
+        auto score_float = score_float_buffer_.Get<float>();
+        AscendC::Duplicate(sum, 0.0f, feature_count);
+        AscendC::Duplicate(correction, 0.0f, feature_count);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        float weight_total = 0.0f;
+        float weight_correction = 0.0f;
+        uint32_t rows_per_tile = kXTileElements / feature_count;
+        rows_per_tile = (rows_per_tile / kVarianceGroupRows) * kVarianceGroupRows;
+
+        for (uint32_t base = begin; base < end; base += kScoreTile) {
+            const uint32_t count = Minimum(kScoreTile, end - base);
+            LoadScores(base, count, maximum, true);
+            for (uint32_t row_base = 0; row_base < count; row_base += rows_per_tile) {
+                const uint32_t rows = Minimum(rows_per_tile, count - row_base);
+                LoadRowsShard(base + row_base, rows, feature_begin, feature_count);
+                for (uint32_t row = 0; row < rows; ++row) {
+                    const float weight = score_float.GetValue(row_base + row);
+                    const float y = weight - weight_correction;
+                    const float next = weight_total + y;
+                    weight_correction = (next - weight_total) - y;
+                    weight_total = next;
+
+                    AscendC::Muls(term, x_float[row * feature_count],
+                        weight, feature_count);
+                    AscendC::Sub(delta, term, correction, feature_count);
+                    AscendC::Add(term, sum, delta, feature_count);
+                    AscendC::Sub(correction, term, sum, feature_count);
+                    AscendC::Sub(correction, correction, delta, feature_count);
+                    AscendC::DataCopy(sum, term, feature_count);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+
+        AscendC::Muls(sum, sum, 1.0f / weight_total, feature_count);
+        AscendC::PipeBarrier<PIPE_V>();
+        RefineShardMean(
+            begin, end, maximum, weight_total, feature_begin, feature_count);
+        AccumulateShardVariance(
+            begin, end, maximum, feature_begin, feature_count);
+        return weight_total;
+    }
+
+    __aicore__ inline void RefineShardMean(
+        uint32_t begin, uint32_t end, float maximum, float normalizer,
+        uint32_t feature_begin, uint32_t feature_count)
+    {
+        auto mean = mean_buffer_.Get<float>();
+        auto residual = mean_residual_buffer_.Get<float>();
+        auto correction = mean_correction_buffer_.Get<float>();
+        auto term = temp_buffer_.Get<float>();
+        auto delta = delta_buffer_.Get<float>();
+        auto x_float = x_float_buffer_.Get<float>();
+        auto score_float = score_float_buffer_.Get<float>();
+        AscendC::Duplicate(residual, 0.0f, feature_count);
+        AscendC::Duplicate(correction, 0.0f, feature_count);
+
+        uint32_t rows_per_tile = kXTileElements / feature_count;
+        rows_per_tile = (rows_per_tile / kVarianceGroupRows) * kVarianceGroupRows;
+
+        for (uint32_t base = begin; base < end; base += kScoreTile) {
+            const uint32_t count = Minimum(kScoreTile, end - base);
+            LoadScores(base, count, maximum, true);
+            for (uint32_t row_base = 0; row_base < count; row_base += rows_per_tile) {
+                const uint32_t rows = Minimum(rows_per_tile, count - row_base);
+                LoadRowsShard(base + row_base, rows, feature_begin, feature_count);
+                for (uint32_t row = 0; row < rows; ++row) {
+                    AscendC::Sub(
+                        term, x_float[row * feature_count], mean, feature_count);
+                    AscendC::Muls(
+                        term, term, score_float.GetValue(row_base + row),
+                        feature_count);
+                    AscendC::Sub(delta, term, correction, feature_count);
+                    AscendC::Add(term, residual, delta, feature_count);
+                    AscendC::Sub(correction, term, residual, feature_count);
+                    AscendC::Sub(correction, correction, delta, feature_count);
+                    AscendC::DataCopy(residual, term, feature_count);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+
+        AscendC::Muls(residual, residual, 1.0f / normalizer, feature_count);
+        AscendC::Add(mean, mean, residual, feature_count);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void AccumulateShardVariance(
+        uint32_t begin, uint32_t end, float maximum,
+        uint32_t feature_begin, uint32_t feature_count)
+    {
+        auto mean = mean_buffer_.Get<float>();
+        auto m2 = m2_buffer_.Get<float>();
+        auto temp = temp_buffer_.Get<float>();
+        auto chunk = variance_chunk_buffer_.Get<float>();
+        auto x_float = x_float_buffer_.Get<float>();
+        auto score_float = score_float_buffer_.Get<float>();
+        AscendC::Duplicate(m2, 0.0f, feature_count);
+
+        uint32_t rows_per_tile = kXTileElements / feature_count;
+        rows_per_tile = (rows_per_tile / kVarianceGroupRows) * kVarianceGroupRows;
+
+        for (uint32_t base = begin; base < end; base += kScoreTile) {
+            const uint32_t count = Minimum(kScoreTile, end - base);
+            LoadScores(base, count, maximum, true);
+            for (uint32_t row_base = 0; row_base < count; row_base += rows_per_tile) {
+                const uint32_t rows = Minimum(rows_per_tile, count - row_base);
+                LoadRowsShard(base + row_base, rows, feature_begin, feature_count);
+                for (uint32_t group_base = 0; group_base < rows;
+                     group_base += kVarianceGroupRows) {
+                    const uint32_t group_rows =
+                        Minimum(kVarianceGroupRows, rows - group_base);
+                    AscendC::Duplicate(chunk, 0.0f, feature_count);
+                    for (uint32_t row = 0; row < group_rows; ++row) {
+                        const uint32_t local_row = group_base + row;
+                        AscendC::Sub(temp,
+                            x_float[local_row * feature_count], mean,
+                            feature_count);
+                        AscendC::Mul(temp, temp, temp, feature_count);
+                        AscendC::Muls(temp, temp,
+                            score_float.GetValue(row_base + local_row),
+                            feature_count);
+                        AscendC::Add(chunk, chunk, temp, feature_count);
+                    }
+                    AscendC::Add(m2, m2, chunk, feature_count);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+        }
+    }
+
+    __aicore__ inline void FinalizeMomentsCount(
+        float normalizer, uint32_t feature_count)
+    {
+        auto m2 = m2_buffer_.Get<float>();
+        AscendC::Muls(m2, m2, 1.0f / normalizer, feature_count);
+        AscendC::Maxs(m2, m2, 0.0f, feature_count);
+        AscendC::Adds(m2, m2, epsilon_, feature_count);
+        AscendC::Rsqrt(m2, m2, feature_count);
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    __aicore__ inline void StoreShardResults(
+        uint32_t segment, uint32_t feature_begin, uint32_t feature_count,
+        float maximum, float normalizer)
+    {
+        auto mean = mean_buffer_.Get<float>();
+        auto m2 = m2_buffer_.Get<float>();
+        auto temp = temp_buffer_.Get<float>();
+        const uint32_t bytes = feature_count * sizeof(float);
+        const uint32_t output_offset = segment * d_ + feature_begin;
+        AscendC::DataCopyPad(
+            mean_gm_[output_offset], mean, {1, bytes, 0, 0});
+        AscendC::DataCopyPad(
+            rstd_gm_[output_offset], m2, {1, bytes, 0, 0});
+
+        if (feature_begin == 0) {
+            auto scalar = reduce_output_buffer_.Get<float>();
+            AscendC::Duplicate(scalar, normalizer, kAlignment);
+            AscendC::Ln(scalar, scalar, kAlignment);
+            AscendC::PipeBarrier<PIPE_V>();
+            temp.SetValue(0, scalar.GetValue(0) + maximum);
+            AscendC::PipeBarrier<PIPE_ALL>();
+            AscendC::DataCopyPad(
+                logsumexp_gm_[segment], temp, {1, sizeof(float), 0, 0});
+        }
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
 
     __aicore__ inline void FinalizeMoments(float normalizer)
