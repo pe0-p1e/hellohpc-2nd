@@ -14,6 +14,8 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <unordered_map>
+#include <cstdint>
 using namespace std;
 #else
 #include <iostream.h>
@@ -50,6 +52,22 @@ struct BHFastPoint {
   unsigned char zref[2 * ghost_width];
 };
 
+struct BHCellKey {
+  Block *b;
+  int idx;
+  bool operator==(const BHCellKey &o) const { return b==o.b && idx==o.idx; }
+};
+struct BHCellKeyHash {
+  size_t operator()(const BHCellKey &k) const {
+    return (reinterpret_cast<uintptr_t>(k.b)>>4) ^ (size_t(k.idx)*0x9e3779b97f4a7c15ULL);
+  }
+};
+struct BHOpCell { Block *b; int idx; };
+struct BHDetOp {
+  std::vector<BHOpCell> cells;
+  std::vector<double> rr, ri, ir, ii;
+};
+
 struct BHFastCache {
   bool configured, ready, valid;
   int lev, maxl, modes, ndet, ord, nth, nph, nm;
@@ -58,6 +76,7 @@ struct BHFastCache {
   std::vector<double> radii, cphi, sphi, thetaA, thetaB;
   std::vector<int> ml, mm;
   std::vector<BHFastPoint> pts;
+  std::vector<BHDetOp> ops;
   std::vector<double> fourier, local, global;
   BHFastCache():configured(false),ready(false),valid(false),lev(-1),maxl(0),
     modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
@@ -267,31 +286,113 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.fourier.assign((size_t)c.ndet*nth*c.nm*4,0.0);
   c.local.assign((size_t)c.ndet*c.modes*2,0.0);
   c.global.assign((size_t)c.ndet*c.modes*2,0.0);
+
+  // Collapse the fixed interpolation + harmonic projection into a sparse
+  // linear operator.  Only geometry/operator weights are cached; field values
+  // are always read fresh in bh_eval().
+  c.ops.clear();
+  c.ops.resize(c.ndet);
+  for(int d=0; d<c.ndet; ++d) {
+    BHDetOp &op=c.ops[d];
+    std::unordered_map<BHCellKey,int,BHCellKeyHash> ids;
+    ids.reserve(c.pts.size()/c.ndet * c.ord + 64);
+
+    for(size_t pp=0; pp<c.pts.size(); ++pp) {
+      const BHFastPoint &p=c.pts[pp];
+      if(p.det!=d) continue;
+      const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+      for(int iz=0; iz<c.ord; ++iz)
+        for(int iy=0; iy<c.ord; ++iy)
+          for(int ix=0; ix<c.ord; ++ix) {
+            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            BHCellKey key={p.b,at};
+            if(ids.find(key)==ids.end()) {
+              int id=(int)op.cells.size();
+              ids.insert(std::make_pair(key,id));
+              BHOpCell oc={p.b,at};
+              op.cells.push_back(oc);
+            }
+          }
+    }
+
+    const size_t total=(size_t)op.cells.size()*c.modes;
+    op.rr.assign(total,0.0);
+    op.ri.assign(total,0.0);
+    op.ir.assign(total,0.0);
+    op.ii.assign(total,0.0);
+
+    for(size_t pp=0; pp<c.pts.size(); ++pp) {
+      const BHFastPoint &p=c.pts[pp];
+      if(p.det!=d) continue;
+      const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+      const double radius=c.radii[d];
+      const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
+
+      for(int iz=0; iz<c.ord; ++iz) {
+        const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
+        for(int iy=0; iy<c.ord; ++iy) {
+          const double wyz=wy[iy]*wz[iz];
+          for(int ix=0; ix<c.ord; ++ix) {
+            const double wR=wx[ix]*wyz;
+            const double wI=wR*izsgn;
+            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            BHCellKey key={p.b,at};
+            int id=ids.find(key)->second;
+            size_t base=(size_t)id*c.modes;
+
+            for(int q=0; q<c.modes; ++q) {
+              int m=c.mm[q], ma=abs(m);
+              double ss=(m<0)?-1.0:1.0;
+              double cs=c.cphi[(size_t)p.ph*c.nm+ma];
+              double sn=c.sphi[(size_t)p.ph*c.nm+ma];
+              double A=c.thetaA[(size_t)q*c.nth+p.th];
+              double B=c.thetaB[(size_t)q*c.nth+p.th];
+
+              op.rr[base+q] += wR*(radius*A*cs);
+              op.ri[base+q] += wI*(radius*B*ss*sn);
+              op.ir[base+q] += wR*(-radius*A*ss*sn);
+              op.ii[base+q] += wI*(radius*B*cs);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Surface points are no longer needed in the timed path once the operator
+  // has been assembled.
+  c.pts.shrink_to_fit();
   c.valid=true;return true;
 }
 
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
-  std::fill(c.fourier.begin(),c.fourier.end(),0.0);
   std::fill(c.local.begin(),c.local.end(),0.0);
-  for(size_t z=0;z<c.pts.size();++z){BHFastPoint &p=c.pts[z];
-    double rr=0.0,ii=0.0;
-    bh_interp_pair(p,c.ord,
-                   p.b->fgfs[rp->sgfn],p.b->fgfs[ip->sgfn],
-                   ip->SoA[2],rr,ii);
-    size_t tr=(size_t)p.ph*c.nm;
-    for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
-      double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
-      f[0]+=rr*cs;f[1]+=rr*sn;f[2]+=ii*cs;f[3]+=ii*sn;}
+
+  for(int d=0; d<c.ndet; ++d) {
+    const BHDetOp &op=c.ops[d];
+    double *outR=&c.local[(size_t)d*c.modes*2];
+    double *outI=outR+c.modes;
+
+    for(size_t j=0; j<op.cells.size(); ++j) {
+      const BHOpCell &cell=op.cells[j];
+      const double rv=cell.b->fgfs[rp->sgfn][cell.idx];
+      const double iv=cell.b->fgfs[ip->sgfn][cell.idx];
+      const size_t base=j*c.modes;
+      const double *crr=&op.rr[base];
+      const double *cri=&op.ri[base];
+      const double *cir=&op.ir[base];
+      const double *cii=&op.ii[base];
+
+      #pragma GCC ivdep
+      for(int q=0; q<c.modes; ++q) {
+        outR[q] += crr[q]*rv + cri[q]*iv;
+        outI[q] += cir[q]*rv + cii[q]*iv;
+      }
+    }
   }
-  for(int d=0;d<c.ndet;++d){double *out=&c.local[(size_t)d*c.modes*2];double r=c.radii[d];
-    for(int q=0;q<c.modes;++q){int m=c.mm[q],ma=abs(m);double ss=m<0?-1.0:1.0,ar=0,ai=0;
-      const double *A=&c.thetaA[(size_t)q*c.nth],*B=&c.thetaB[(size_t)q*c.nth];
-      for(int t=0;t<c.nth;++t){const double *f=&c.fourier[bh_fidx(c,d,t,ma,0)];
-        double rc=f[0],rs=ss*f[1],ic=f[2],is=ss*f[3];
-        ar+=A[t]*rc+B[t]*is;ai+=B[t]*ic-A[t]*rs;}
-      out[q]=ar*r;out[c.modes+q]=ai*r;
-    }}
-  MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
+
+  MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),
+             MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
   c.ready=true;
 }
 }
