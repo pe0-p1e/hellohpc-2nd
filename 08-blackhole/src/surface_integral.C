@@ -80,8 +80,8 @@ struct BHFourierOp {
   std::vector<const double*> raddr, iaddr;
   std::vector<unsigned short> th;
   std::vector<int> corr;
-  std::vector<double> w;   // exact-size interleaved cos/sin weights
-  std::vector<double> cw;  // sparse I parity corrections
+  std::vector<double> wc, ws;   // exact-size SoA Fourier weights
+  std::vector<double> cwc, cws; // sparse I parity corrections
   std::vector<size_t> theta_begin; // nth+1 offsets after warmup sort
 };
 
@@ -482,25 +482,29 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
                 op.iaddr.push_back(p.b->fgfs[ip->sgfn]+at);
                 op.th.push_back((unsigned short)p.th);
                 op.corr.push_back(-1);
-                op.w.resize(op.w.size()+(size_t)2*c.nm,0.0);
+                op.wc.resize(op.wc.size()+(size_t)c.nm,0.0);
+                op.ws.resize(op.ws.size()+(size_t)c.nm,0.0);
               } else id=it->second;
 
-              double *dst=&op.w[(size_t)id*2*c.nm];
+              double *dc=&op.wc[(size_t)id*c.nm];
+              double *ds=&op.ws[(size_t)id*c.nm];
               for(int m=0;m<c.nm;++m) {
-                dst[2*m]   += ww*c.cphi[tr+m];
-                dst[2*m+1] += ww*c.sphi[tr+m];
+                dc[m] += ww*c.cphi[tr+m];
+                ds[m] += ww*c.sphi[tr+m];
               }
 
               if(idelta!=0.0) {
                 if(op.corr[id]<0) {
-                  op.corr[id]=(int)(op.cw.size()/(2*c.nm));
-                  op.cw.resize(op.cw.size()+(size_t)2*c.nm,0.0);
+                  op.corr[id]=(int)(op.cwc.size()/c.nm);
+                  op.cwc.resize(op.cwc.size()+(size_t)c.nm,0.0);
+                  op.cws.resize(op.cws.size()+(size_t)c.nm,0.0);
                 }
-                double *cdst=&op.cw[(size_t)op.corr[id]*2*c.nm];
+                double *cdc=&op.cwc[(size_t)op.corr[id]*c.nm];
+                double *cds=&op.cws[(size_t)op.corr[id]*c.nm];
                 const double dw=ww*idelta;
                 for(int m=0;m<c.nm;++m) {
-                  cdst[2*m]   += dw*c.cphi[tr+m];
-                  cdst[2*m+1] += dw*c.sphi[tr+m];
+                  cdc[m] += dw*c.cphi[tr+m];
+                  cds[m] += dw*c.sphi[tr+m];
                 }
               }
             }
@@ -519,22 +523,26 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       std::vector<const double*> nraddr(nr), niaddr(nr);
       std::vector<unsigned short> nthv(nr);
       std::vector<int> ncorr(nr);
-      std::vector<double> nw(nr*(size_t)2*c.nm);
+      std::vector<double> nwc(nr*(size_t)c.nm), nws(nr*(size_t)c.nm);
       for(size_t dst=0;dst<nr;++dst) {
         const size_t src=order[dst];
         nraddr[dst]=op.raddr[src];
         niaddr[dst]=op.iaddr[src];
         nthv[dst]=op.th[src];
         ncorr[dst]=op.corr[src];
-        std::copy(&op.w[src*(size_t)2*c.nm],
-                  &op.w[(src+1)*(size_t)2*c.nm],
-                  &nw[dst*(size_t)2*c.nm]);
+        std::copy(&op.wc[src*(size_t)c.nm],
+                  &op.wc[(src+1)*(size_t)c.nm],
+                  &nwc[dst*(size_t)c.nm]);
+        std::copy(&op.ws[src*(size_t)c.nm],
+                  &op.ws[(src+1)*(size_t)c.nm],
+                  &nws[dst*(size_t)c.nm]);
       }
       op.raddr.swap(nraddr);
       op.iaddr.swap(niaddr);
       op.th.swap(nthv);
       op.corr.swap(ncorr);
-      op.w.swap(nw);
+      op.wc.swap(nwc);
+      op.ws.swap(nws);
 
       op.theta_begin.assign((size_t)c.nth+1,nr);
       size_t pos=0;
@@ -608,23 +616,24 @@ static inline void bh_fourier_theta_grouped(BHFastCache &c,int d) {
 
     for(size_t j=beg;j<end;++j) {
       const double rv=*op.raddr[j], iv=*op.iaddr[j];
-      const double *w=&op.w[j*(2*NM)];
+      const double *wc=&op.wc[j*NM];
+      const double *ws=&op.ws[j*NM];
       #pragma GCC unroll 10
       for(int m=0;m<NM;++m) {
-        const double wc=w[2*m], ws=w[2*m+1];
-        rc[m] += wc*rv;
-        rs[m] += ws*rv;
-        ic[m] += wc*iv;
-        is[m] += ws*iv;
+        rc[m] += wc[m]*rv;
+        rs[m] += ws[m]*rv;
+        ic[m] += wc[m]*iv;
+        is[m] += ws[m]*iv;
       }
 
       const int ci=op.corr[j];
       if(ci>=0) {
-        const double *cw=&op.cw[(size_t)ci*(2*NM)];
+        const double *cc=&op.cwc[(size_t)ci*NM];
+        const double *cs=&op.cws[(size_t)ci*NM];
         #pragma GCC unroll 10
         for(int m=0;m<NM;++m) {
-          ic[m] += cw[2*m]*iv;
-          is[m] += cw[2*m+1]*iv;
+          ic[m] += cc[m]*iv;
+          is[m] += cs[m]*iv;
         }
       }
     }
@@ -653,12 +662,8 @@ static inline void bh_fourier_theta8_avx512(BHFastCache &c,int d) {
       const __m512d rv=_mm512_set1_pd(*op.raddr[j]);
       const __m512d iv=_mm512_set1_pd(*op.iaddr[j]);
 
-      // NM=8, weights are interleaved [c0,s0,c1,s1,...].
-      const double *w=&op.w[j*16u];
-      alignas(64) double wcA[8],wsA[8];
-      for(int m=0;m<8;++m){wcA[m]=w[2*m];wsA[m]=w[2*m+1];}
-      const __m512d wc=_mm512_load_pd(wcA);
-      const __m512d ws=_mm512_load_pd(wsA);
+      const __m512d wc=_mm512_loadu_pd(&op.wc[j*8u]);
+      const __m512d ws=_mm512_loadu_pd(&op.ws[j*8u]);
 
       rc=_mm512_fmadd_pd(wc,rv,rc);
       rs=_mm512_fmadd_pd(ws,rv,rs);
@@ -667,11 +672,8 @@ static inline void bh_fourier_theta8_avx512(BHFastCache &c,int d) {
 
       const int ci=op.corr[j];
       if(ci>=0) {
-        const double *cw=&op.cw[(size_t)ci*16u];
-        alignas(64) double ccA[8],csA[8];
-        for(int m=0;m<8;++m){ccA[m]=cw[2*m];csA[m]=cw[2*m+1];}
-        ic=_mm512_fmadd_pd(_mm512_load_pd(ccA),iv,ic);
-        is=_mm512_fmadd_pd(_mm512_load_pd(csA),iv,is);
+        ic=_mm512_fmadd_pd(_mm512_loadu_pd(&op.cwc[(size_t)ci*8u]),iv,ic);
+        is=_mm512_fmadd_pd(_mm512_loadu_pd(&op.cws[(size_t)ci*8u]),iv,is);
       }
     }
 
@@ -734,14 +736,14 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
         for(size_t j=0;j<op.th.size();++j) {
           const double rv=*op.raddr[j],iv=*op.iaddr[j];
           double *ff=&c.fourier[bh_fidx(c,d,(int)op.th[j],0,0)];
-          const double *w=&op.w[j*(size_t)(2*c.nm)];
+          const double *w=&op.wc[j*(size_t)(2*c.nm)];
           for(int m=0;m<c.nm;++m) {
             const double wc=w[2*m],ws=w[2*m+1];
             ff[4*m]+=wc*rv; ff[4*m+1]+=ws*rv;
             ff[4*m+2]+=wc*iv; ff[4*m+3]+=ws*iv;
           }
           if(op.corr[j]>=0) {
-            const double *cw=&op.cw[(size_t)op.corr[j]*(2*c.nm)];
+            const double *cw=&op.cwc[(size_t)op.corr[j]*(2*c.nm)];
             for(int m=0;m<c.nm;++m) {
               ff[4*m+2]+=cw[2*m]*iv;
               ff[4*m+3]+=cw[2*m+1]*iv;
