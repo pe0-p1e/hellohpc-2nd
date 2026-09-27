@@ -14,6 +14,9 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#ifdef __AVX512F__
+#include <immintrin.h>
+#endif
 using namespace std;
 #else
 #include <iostream.h>
@@ -417,6 +420,50 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.valid=true;return true;
 }
 
+#ifdef __AVX512F__
+static inline void bh_eval_medium21_avx512(const BHFullDet &op,
+                                            double *outR,double *outI) {
+  __m512d r0=_mm512_setzero_pd(), r1=_mm512_setzero_pd(), r2=_mm512_setzero_pd();
+  __m512d i0=_mm512_setzero_pd(), i1=_mm512_setzero_pd(), i2=_mm512_setzero_pd();
+  const __mmask8 tail=(__mmask8)0x1f; // modes 16..20
+
+  const size_t nc=op.raddr.size();
+  for(size_t j=0;j<nc;++j) {
+    const __m512d rv=_mm512_set1_pd(*op.raddr[j]);
+    const __m512d iv=_mm512_set1_pd(*op.iaddr[j]);
+    const size_t b=j*21u;
+
+    __m512d a=_mm512_loadu_pd(&op.rr[b]);
+    __m512d c=_mm512_loadu_pd(&op.ri[b]);
+    r0=_mm512_fmadd_pd(c,iv,_mm512_fmadd_pd(a,rv,r0));
+    a=_mm512_loadu_pd(&op.ir[b]);
+    c=_mm512_loadu_pd(&op.ii[b]);
+    i0=_mm512_fmadd_pd(c,iv,_mm512_fmadd_pd(a,rv,i0));
+
+    a=_mm512_loadu_pd(&op.rr[b+8]);
+    c=_mm512_loadu_pd(&op.ri[b+8]);
+    r1=_mm512_fmadd_pd(c,iv,_mm512_fmadd_pd(a,rv,r1));
+    a=_mm512_loadu_pd(&op.ir[b+8]);
+    c=_mm512_loadu_pd(&op.ii[b+8]);
+    i1=_mm512_fmadd_pd(c,iv,_mm512_fmadd_pd(a,rv,i1));
+
+    a=_mm512_maskz_loadu_pd(tail,&op.rr[b+16]);
+    c=_mm512_maskz_loadu_pd(tail,&op.ri[b+16]);
+    r2=_mm512_fmadd_pd(c,iv,_mm512_fmadd_pd(a,rv,r2));
+    a=_mm512_maskz_loadu_pd(tail,&op.ir[b+16]);
+    c=_mm512_maskz_loadu_pd(tail,&op.ii[b+16]);
+    i2=_mm512_fmadd_pd(c,iv,_mm512_fmadd_pd(a,rv,i2));
+  }
+
+  _mm512_storeu_pd(outR,r0);
+  _mm512_storeu_pd(outR+8,r1);
+  _mm512_mask_storeu_pd(outR+16,tail,r2);
+  _mm512_storeu_pd(outI,i0);
+  _mm512_storeu_pd(outI+8,i1);
+  _mm512_mask_storeu_pd(outI+16,tail,i2);
+}
+#endif
+
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   (void)rp; (void)ip;
   std::fill(c.local.begin(),c.local.end(),0.0);
@@ -425,8 +472,15 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
     const BHFullDet &op=c.fullop[d];
     double *outR=&c.local[(size_t)d*c.modes*2];
     double *outI=outR+c.modes;
-    const size_t nc=op.raddr.size();
 
+#ifdef __AVX512F__
+    if(c.modes==21) {
+      bh_eval_medium21_avx512(op,outR,outI);
+      continue;
+    }
+#endif
+
+    const size_t nc=op.raddr.size();
     for(size_t j=0;j<nc;++j) {
       const double rv=*op.raddr[j];
       const double iv=*op.iaddr[j];
