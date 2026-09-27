@@ -256,7 +256,22 @@ void sha256_arm_blocks(std::uint32_t state[8],
 
 [[nodiscard]] inline Digest fast_frame_sha256(
     std::span<const std::uint8_t> bytes) {
-    return sha256_arm(bytes);
+    static int arm_sha_mode = 0;
+    if (arm_sha_mode > 0) [[likely]] {
+        return sha256_arm(bytes);
+    }
+    if (arm_sha_mode < 0) [[unlikely]] {
+        return sha256(bytes);
+    }
+
+    const Digest hardware = sha256_arm(bytes);
+    const Digest software = sha256(bytes);
+    if (hardware == software) {
+        arm_sha_mode = 1;
+        return hardware;
+    }
+    arm_sha_mode = -1;
+    return software;
 }
 
 #else
