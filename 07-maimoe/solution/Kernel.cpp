@@ -1105,7 +1105,7 @@ inline void fast_rectangle(
     y0 = std::max(y0, 0);
     x1 = std::min(x1, static_cast<int>(kCanvasWidth) - 1);
     y1 = std::min(y1, static_cast<int>(kCanvasHeight) - 1);
-    if (x0 > x1 || y0 > y1) {
+    if (x0 > x1 || y0 > y1 || x1 < 2 || y1 < 2) {
         return;
     }
 
