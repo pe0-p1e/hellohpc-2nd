@@ -1,4 +1,4 @@
-cpu_workers = 8
+cpu_workers = 6
 input_readers = 1
 prefetch_depth = 32
 compute_batch = 1
