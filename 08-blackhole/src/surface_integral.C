@@ -191,7 +191,7 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   std::fill(c.fourier.begin(),c.fourier.end(),0.0);
   std::fill(c.local.begin(),c.local.end(),0.0);
-  for(size_t z=0;z<c.pts.size();++z){const BHFastPoint &p=c.pts[z];
+  for(size_t z=0;z<c.pts.size();++z){BHFastPoint &p=c.pts[z];
     double rr=0.0,ii=0.0;
     int sym=1, sst=-1;
     double xx=p.x[0],yy=p.x[1],zz=p.x[2];
