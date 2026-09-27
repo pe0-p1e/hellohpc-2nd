@@ -10,7 +10,7 @@ all: md5fastcoll run
 md5fastcoll: $(OBJS)
 	$(CXX) $(CPPFLAGS) $(LIBS) $^ -o $@
 
-run: run.sh run.py
+run: run.sh
 	cp -f run.sh run
 	chmod +x run
 
