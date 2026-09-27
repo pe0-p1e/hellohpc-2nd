@@ -1,8 +1,0 @@
-.local/
-.venv/
-.namespace/
-.tmp/
-build/
-artifacts/
-__pycache__/
-.pytest_cache/
