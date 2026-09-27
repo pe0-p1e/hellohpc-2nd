@@ -4,21 +4,32 @@
 
 uint32 seed32_1, seed32_2;
 
+namespace {
+const std::vector<uint32> q4mask = [] {
+	std::vector<uint32> v(1<<4);
+	for (unsigned k = 0; k < v.size(); ++k)
+		v[k] = ((k<<2) ^ (k<<26)) & 0x38000004;
+	return v;
+}();
+
+const std::vector<uint32> q9q10mask = [] {
+	std::vector<uint32> v(1<<3);
+	for (unsigned k = 0; k < v.size(); ++k)
+		v[k] = ((k<<13) ^ (k<<4)) & 0x2060;
+	return v;
+}();
+
+const std::vector<uint32> q9mask = [] {
+	std::vector<uint32> v(1<<16);
+	for (unsigned k = 0; k < v.size(); ++k)
+		v[k] = ((k<<1) ^ (k<<2) ^ (k<<5) ^ (k<<7) ^ (k<<8) ^ (k<<10) ^ (k<<11) ^ (k<<13)) & 0x0eb94f16;
+	return v;
+}();
+}
+
 void find_block0(uint32 block[], const uint32 IV[])
 {
 	uint32 Q[68] = { IV[0], IV[3], IV[2], IV[1] };
-
-	std::vector<uint32> q4mask(1<<4);
-	for (unsigned k = 0; k < q4mask.size(); ++k)
-		q4mask[k] = ((k<<2) ^ (k<<26)) & 0x38000004;
-
-	std::vector<uint32> q9q10mask(1<<3);
-	for (unsigned k = 0; k < q9q10mask.size(); ++k)
-		q9q10mask[k] = ((k<<13) ^ (k<<4)) & 0x2060;
-		
-	std::vector<uint32> q9mask(1<<16);
-	for (unsigned k = 0; k < q9mask.size(); ++k)
-		q9mask[k] = ((k<<1) ^ (k<<2) ^ (k<<5) ^ (k<<7) ^ (k<<8) ^ (k<<10) ^ (k<<11) ^ (k<<13)) & 0x0eb94f16;
 
 	while (true)
 	{
