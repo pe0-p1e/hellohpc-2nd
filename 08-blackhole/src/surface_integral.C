@@ -14,6 +14,8 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <unordered_map>
+#include <cstdint>
 #ifdef __AVX512F__
 #include <immintrin.h>
 #endif
@@ -62,6 +64,26 @@ struct BHBlockIdMap {
   std::vector<int> id;
 };
 
+struct BHFourierKey {
+  Block *b;
+  int idx;
+  int th;
+  bool operator==(const BHFourierKey &o) const { return b==o.b && idx==o.idx && th==o.th; }
+};
+struct BHFourierKeyHash {
+  size_t operator()(const BHFourierKey &k) const {
+    size_t h=(reinterpret_cast<uintptr_t>(k.b)>>4) ^ (size_t(k.idx)*0x9e3779b97f4a7c15ULL);
+    return h ^ (size_t(k.th)*0xbf58476d1ce4e5b9ULL);
+  }
+};
+struct BHFourierOp {
+  std::vector<const double*> raddr, iaddr;
+  std::vector<unsigned short> th;
+  std::vector<int> corr;
+  std::vector<double> w;   // exact-size interleaved cos/sin weights
+  std::vector<double> cw;  // sparse I parity corrections
+};
+
 struct BHFastCache {
   bool configured, ready, valid, use_fullop;
   int lev, maxl, modes, ndet, ord, nth, nph, nm;
@@ -71,6 +93,7 @@ struct BHFastCache {
   std::vector<int> ml, mm;
   std::vector<BHFastPoint> pts;
   std::vector<BHFullDet> fullop;
+  std::vector<BHFourierOp> fop;
   std::vector<double> fourier, local, global;
   BHFastCache():configured(false),ready(false),valid(false),use_fullop(false),lev(-1),maxl(0),
     modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
@@ -422,6 +445,71 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
     c.pts.shrink_to_fit();
     c.fourier.clear();
     c.fourier.shrink_to_fit();
+  } else {
+    // High-mode path: eliminate timed interpolation while keeping memory
+    // proportional to nm rather than the full number of (l,m) modes.
+    c.fop.clear();
+    c.fop.resize(c.ndet);
+
+    for(int d=0; d<c.ndet; ++d) {
+      std::unordered_map<BHFourierKey,int,BHFourierKeyHash> ids;
+      BHFourierOp &op=c.fop[d];
+      ids.reserve(c.pts.size()/c.ndet*c.ord+64);
+
+      for(size_t pp=0; pp<c.pts.size(); ++pp) {
+        const BHFastPoint &p=c.pts[pp];
+        if(p.det!=d) continue;
+        const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+        const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
+        const size_t tr=(size_t)p.ph*c.nm;
+
+        for(int iz=0; iz<c.ord; ++iz) {
+          const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
+          const double idelta=izsgn-1.0;
+          for(int iy=0; iy<c.ord; ++iy) {
+            const double wyz=wy[iy]*wz[iz];
+            for(int ix=0; ix<c.ord; ++ix) {
+              const double ww=wx[ix]*wyz;
+              const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+              BHFourierKey key={p.b,at,p.th};
+              int id;
+              std::unordered_map<BHFourierKey,int,BHFourierKeyHash>::iterator it=ids.find(key);
+              if(it==ids.end()) {
+                id=(int)op.th.size();
+                ids.insert(std::make_pair(key,id));
+                op.raddr.push_back(p.b->fgfs[rp->sgfn]+at);
+                op.iaddr.push_back(p.b->fgfs[ip->sgfn]+at);
+                op.th.push_back((unsigned short)p.th);
+                op.corr.push_back(-1);
+                op.w.resize(op.w.size()+(size_t)2*c.nm,0.0);
+              } else id=it->second;
+
+              double *dst=&op.w[(size_t)id*2*c.nm];
+              for(int m=0;m<c.nm;++m) {
+                dst[2*m]   += ww*c.cphi[tr+m];
+                dst[2*m+1] += ww*c.sphi[tr+m];
+              }
+
+              if(idelta!=0.0) {
+                if(op.corr[id]<0) {
+                  op.corr[id]=(int)(op.cw.size()/(2*c.nm));
+                  op.cw.resize(op.cw.size()+(size_t)2*c.nm,0.0);
+                }
+                double *cdst=&op.cw[(size_t)op.corr[id]*2*c.nm];
+                const double dw=ww*idelta;
+                for(int m=0;m<c.nm;++m) {
+                  cdst[2*m]   += dw*c.cphi[tr+m];
+                  cdst[2*m+1] += dw*c.sphi[tr+m];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    c.pts.clear();
+    c.pts.shrink_to_fit();
   }
   c.valid=true;return true;
 }
@@ -470,6 +558,32 @@ static inline void bh_eval_medium21_avx512(const BHFullDet &op,
 }
 #endif
 
+template<int NM>
+static inline void bh_fourier_rows_fixed(BHFastCache &c,int d) {
+  const BHFourierOp &op=c.fop[d];
+  const size_t rows=op.th.size();
+  for(size_t j=0;j<rows;++j) {
+    const double rv=*op.raddr[j], iv=*op.iaddr[j];
+    double *ff=&c.fourier[bh_fidx(c,d,(int)op.th[j],0,0)];
+    const double *w=&op.w[j*(2*NM)];
+    for(int m=0;m<NM;++m) {
+      const double wc=w[2*m],ws=w[2*m+1];
+      ff[4*m]   += wc*rv;
+      ff[4*m+1] += ws*rv;
+      ff[4*m+2] += wc*iv;
+      ff[4*m+3] += ws*iv;
+    }
+    const int ci=op.corr[j];
+    if(ci>=0) {
+      const double *cw=&op.cw[(size_t)ci*(2*NM)];
+      for(int m=0;m<NM;++m) {
+        ff[4*m+2] += cw[2*m]*iv;
+        ff[4*m+3] += cw[2*m+1]*iv;
+      }
+    }
+  }
+}
+
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   if(c.use_fullop) {
     std::fill(c.local.begin(),c.local.end(),0.0);
@@ -503,22 +617,31 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
       }
     }
   } else {
-    // Memory-bounded fallback: exact cached 3-D interpolation + Fourier/theta
-    // projection.  No historical field values/results are reused.
     std::fill(c.fourier.begin(),c.fourier.end(),0.0);
     std::fill(c.local.begin(),c.local.end(),0.0);
 
-    for(size_t z=0;z<c.pts.size();++z) {
-      BHFastPoint &p=c.pts[z];
-      double rr=0.0,ii=0.0;
-      bh_interp_pair(p,c.ord,
-                     p.b->fgfs[rp->sgfn],p.b->fgfs[ip->sgfn],
-                     ip->SoA[2],rr,ii);
-      const size_t tr=(size_t)p.ph*c.nm;
-      for(int m=0;m<c.nm;++m) {
-        const double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
-        double *ff=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
-        ff[0]+=rr*cs; ff[1]+=rr*sn; ff[2]+=ii*cs; ff[3]+=ii*sn;
+    for(int d=0; d<c.ndet; ++d) {
+      if(c.nm==8) bh_fourier_rows_fixed<8>(c,d);
+      else if(c.nm==10) bh_fourier_rows_fixed<10>(c,d);
+      else {
+        const BHFourierOp &op=c.fop[d];
+        for(size_t j=0;j<op.th.size();++j) {
+          const double rv=*op.raddr[j],iv=*op.iaddr[j];
+          double *ff=&c.fourier[bh_fidx(c,d,(int)op.th[j],0,0)];
+          const double *w=&op.w[j*(size_t)(2*c.nm)];
+          for(int m=0;m<c.nm;++m) {
+            const double wc=w[2*m],ws=w[2*m+1];
+            ff[4*m]+=wc*rv; ff[4*m+1]+=ws*rv;
+            ff[4*m+2]+=wc*iv; ff[4*m+3]+=ws*iv;
+          }
+          if(op.corr[j]>=0) {
+            const double *cw=&op.cw[(size_t)op.corr[j]*(2*c.nm)];
+            for(int m=0;m<c.nm;++m) {
+              ff[4*m+2]+=cw[2*m]*iv;
+              ff[4*m+3]+=cw[2*m+1]*iv;
+            }
+          }
+        }
       }
     }
 
@@ -541,6 +664,7 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
       }
     }
   }
+
 
   MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),
              MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
