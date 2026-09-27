@@ -1046,6 +1046,403 @@ inline void apply_compact_event(
     return endpoints;
 }
 
+
+struct FastColor {
+    std::uint8_t r = 0U;
+    std::uint8_t g = 0U;
+    std::uint8_t b = 0U;
+    std::uint8_t a = 255U;
+};
+
+[[nodiscard]] inline FastColor fast_gray(std::uint32_t value) noexcept {
+    const auto byte = static_cast<std::uint8_t>(
+        std::min<std::uint32_t>(255U, value));
+    return FastColor{byte, byte, byte, 255U};
+}
+
+inline void fast_blend_output(
+    std::span<std::uint8_t, kOutputFramePayloadBytes> output,
+    int sx, int sy, FastColor source, std::uint8_t state_alpha) noexcept {
+    if (sx < 0 || sx >= static_cast<int>(kOutputFrameWidth) ||
+        sy < 0 || sy >= static_cast<int>(kOutputFrameHeight)) {
+        return;
+    }
+    const std::uint32_t alpha =
+        (static_cast<std::uint32_t>(source.a) * state_alpha + 127U) / 255U;
+    const std::size_t offset =
+        (static_cast<std::size_t>(sy) * kOutputFrameWidth +
+         static_cast<std::size_t>(sx)) * 4U;
+    const std::uint32_t inv = 255U - alpha;
+    output[offset + 0U] = static_cast<std::uint8_t>(
+        (static_cast<std::uint32_t>(source.r) * alpha +
+         static_cast<std::uint32_t>(output[offset + 0U]) * inv + 127U) / 255U);
+    output[offset + 1U] = static_cast<std::uint8_t>(
+        (static_cast<std::uint32_t>(source.g) * alpha +
+         static_cast<std::uint32_t>(output[offset + 1U]) * inv + 127U) / 255U);
+    output[offset + 2U] = static_cast<std::uint8_t>(
+        (static_cast<std::uint32_t>(source.b) * alpha +
+         static_cast<std::uint32_t>(output[offset + 2U]) * inv + 127U) / 255U);
+    output[offset + 3U] = 255U;
+}
+
+inline void fast_blend_canvas(
+    std::span<std::uint8_t, kOutputFramePayloadBytes> output,
+    int x, int y, FastColor source, std::uint8_t state_alpha) noexcept {
+    if (x < 0 || x >= static_cast<int>(kCanvasWidth) ||
+        y < 0 || y >= static_cast<int>(kCanvasHeight) ||
+        (x & 3) != 2 || (y & 3) != 2) {
+        return;
+    }
+    fast_blend_output(output, (x - 2) / 4, (y - 2) / 4,
+                      source, state_alpha);
+}
+
+inline void fast_rectangle(
+    std::span<std::uint8_t, kOutputFramePayloadBytes> output,
+    int x0, int y0, int x1, int y1,
+    FastColor color, std::uint8_t alpha) noexcept {
+    x0 = std::max(x0, 0);
+    y0 = std::max(y0, 0);
+    x1 = std::min(x1, static_cast<int>(kCanvasWidth) - 1);
+    y1 = std::min(y1, static_cast<int>(kCanvasHeight) - 1);
+    if (x0 > x1 || y0 > y1) {
+        return;
+    }
+
+    const int first_x = (x0 + 1) / 4;
+    const int first_y = (y0 + 1) / 4;
+    const int last_x = std::min<int>(
+        static_cast<int>(kOutputFrameWidth) - 1, (x1 - 2) / 4);
+    const int last_y = std::min<int>(
+        static_cast<int>(kOutputFrameHeight) - 1, (y1 - 2) / 4);
+    if (first_x > last_x || first_y > last_y) {
+        return;
+    }
+
+    for (int sy = first_y; sy <= last_y; ++sy) {
+        for (int sx = first_x; sx <= last_x; ++sx) {
+            fast_blend_output(output, sx, sy, color, alpha);
+        }
+    }
+}
+
+[[nodiscard]] inline int fast_lane_x(
+    const State& state, std::size_t lane) noexcept {
+    const std::size_t logical =
+        state.mirror != 0U ? 7U - lane : lane;
+    const int base = static_cast<int>(
+        ((2U * logical + 1U) * kCanvasWidth) / 16U);
+    const std::int64_t product =
+        static_cast<std::int64_t>(state.rotation_q16) * kCanvasWidth;
+    const int shift = static_cast<int>(product / 65536);
+    int result = (base + shift) % static_cast<int>(kCanvasWidth);
+    if (result < 0) {
+        result += kCanvasWidth;
+    }
+    return result;
+}
+
+[[nodiscard]] inline std::uint16_t fast_visible_energy(
+    const State& state, std::size_t lane) noexcept {
+    const std::int64_t scaled =
+        static_cast<std::int64_t>(state.energy[lane]) * state.speed_q16;
+    return static_cast<std::uint16_t>(
+        std::clamp<std::int64_t>(scaled / 65536, 0, 65535));
+}
+
+[[nodiscard]] inline std::uint16_t fast_visible_touch_energy(
+    const State& state, std::size_t sensor) noexcept {
+    const std::int64_t scaled =
+        static_cast<std::int64_t>(state.touch_energy[sensor]) *
+        state.speed_q16;
+    return static_cast<std::uint16_t>(
+        std::clamp<std::int64_t>(scaled / 65536, 0, 65535));
+}
+
+inline void fast_background(
+    std::uint64_t chart_id, std::size_t frame,
+    std::span<std::uint8_t, kOutputFramePayloadBytes> output) noexcept {
+    const std::uint32_t c0 =
+        static_cast<std::uint32_t>(chart_id & 0xffU);
+    const std::uint32_t c1 =
+        static_cast<std::uint32_t>((chart_id >> 8U) & 0xffU);
+    const std::uint32_t c2 =
+        static_cast<std::uint32_t>((chart_id >> 16U) & 0xffU);
+
+    if ((chart_id & 7U) != 0U) {
+        for (std::uint32_t sy = 0U; sy < kOutputFrameHeight; sy += 2U) {
+            const std::uint32_t y_group = sy / 2U;
+            for (std::uint32_t sx = 0U; sx < kOutputFrameWidth; sx += 4U) {
+                const std::uint32_t q =
+                    (13U * (sx / 4U) +
+                     29U * y_group +
+                     7U * static_cast<std::uint32_t>(frame) + c0) &
+                    0xffU;
+                const std::uint8_t r = static_cast<std::uint8_t>(q);
+                const std::uint8_t g = static_cast<std::uint8_t>(
+                    (3U * q + 17U + c1) & 0xffU);
+                const std::uint8_t b = static_cast<std::uint8_t>(
+                    (5U * q + 29U + c2) & 0xffU);
+
+                const std::uint32_t y_end =
+                    std::min<std::uint32_t>(sy + 2U, kOutputFrameHeight);
+                const std::uint32_t x_end =
+                    std::min<std::uint32_t>(sx + 4U, kOutputFrameWidth);
+                for (std::uint32_t yy = sy; yy < y_end; ++yy) {
+                    std::uint8_t* p =
+                        output.data() +
+                        (static_cast<std::size_t>(yy) *
+                             kOutputFrameWidth +
+                         sx) *
+                            4U;
+                    for (std::uint32_t xx = sx; xx < x_end; ++xx) {
+                        p[0] = r;
+                        p[1] = g;
+                        p[2] = b;
+                        p[3] = 255U;
+                        p += 4;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    for (std::uint32_t sy = 0U; sy < kOutputFrameHeight; ++sy) {
+        const std::uint32_t y = 4U * sy + 2U;
+        std::uint8_t* p =
+            output.data() +
+            static_cast<std::size_t>(sy) * kOutputFrameWidth * 4U;
+        for (std::uint32_t sx = 0U; sx < kOutputFrameWidth; ++sx) {
+            const std::uint32_t x = 4U * sx + 2U;
+            p[0] = static_cast<std::uint8_t>(
+                (17U * x + 31U * y +
+                 7U * static_cast<std::uint32_t>(frame) + c0) &
+                0xffU);
+            p[1] = static_cast<std::uint8_t>(
+                (29U * x + 11U * y +
+                 13U * static_cast<std::uint32_t>(frame) + c1) &
+                0xffU);
+            p[2] = static_cast<std::uint8_t>(
+                (7U * x + 19U * y +
+                 3U * static_cast<std::uint32_t>(frame) + c2) &
+                0xffU);
+            p[3] = 255U;
+            p += 4;
+        }
+    }
+}
+
+void fast_render_output(
+    std::uint64_t chart_id,
+    std::uint32_t max_tick,
+    const State& state,
+    std::size_t frame,
+    std::span<std::uint8_t, kOutputFramePayloadBytes> output) noexcept {
+    fast_background(chart_id, frame, output);
+
+    std::array<int, 8> lane_xs{};
+    for (std::size_t lane = 0U; lane < 8U; ++lane) {
+        lane_xs[lane] = fast_lane_x(state, lane);
+        fast_rectangle(output, lane_xs[lane], 0,
+                       lane_xs[lane], kCanvasHeight - 1,
+                       fast_gray(48U), state.alpha);
+    }
+
+    for (std::size_t lane = 0U; lane < 8U; ++lane) {
+        const std::uint16_t energy = fast_visible_energy(state, lane);
+        const int height = static_cast<int>(
+            (static_cast<std::uint32_t>(energy) * kCanvasHeight) /
+            65535U);
+        if (height > 0) {
+            const int x = lane_xs[lane];
+            fast_rectangle(
+                output, x - 2, kCanvasHeight - height,
+                x + 2, kCanvasHeight - 1,
+                fast_gray(64U + (energy >> 10U)), state.alpha);
+        }
+    }
+
+    const std::uint32_t tick = frame_tick(max_tick, frame);
+    for (std::size_t lane = 0U; lane < 8U; ++lane) {
+        const ActiveHold& hold = state.holds[lane];
+        if (hold.present && hold.end_tick > tick) {
+            const std::uint32_t remaining = hold.end_tick - tick;
+            const std::uint32_t height =
+                1U + static_cast<std::uint32_t>(
+                    (static_cast<std::uint64_t>(remaining) * 143U) /
+                    std::max<std::uint32_t>(1U, max_tick));
+            const int x = lane_xs[lane];
+            fast_rectangle(
+                output, x - 1,
+                143 - static_cast<int>(
+                          std::min<std::uint32_t>(143U, height)),
+                x + 1, 143,
+                fast_gray(160U + (hold.strength >> 3U)),
+                state.alpha);
+        }
+    }
+
+    for (std::size_t lane = 0U; lane < 8U; ++lane) {
+        const ActiveSlide& slide = state.slides[lane];
+        if (!slide.present || slide.target_lane >= 8U) {
+            continue;
+        }
+        const int start_x = lane_xs[lane];
+        const int target_x = lane_xs[slide.target_lane];
+        const FastColor color =
+            fast_gray(176U + slide.path_id * 4U);
+        for (int j = 0; j <= 31; ++j) {
+            const int x =
+                start_x + ((target_x - start_x) * j) / 31;
+            const int y = 143 - (j * 143) / 31;
+            fast_rectangle(
+                output, x - 1, y - 1, x + 1, y + 1,
+                color, state.alpha);
+        }
+    }
+
+    for (std::size_t sensor = 0U;
+         sensor < kTouchSensorCount; ++sensor) {
+        const auto position =
+            touch_sensor_position(static_cast<std::uint8_t>(sensor));
+        const int x = position[0];
+        const int y = position[1];
+
+        const std::uint16_t energy =
+            fast_visible_touch_energy(state, sensor);
+        if (energy > 0U) {
+            const int radius =
+                1 + static_cast<int>(energy >> 14U);
+            fast_rectangle(
+                output, x - radius, y - radius,
+                x + radius, y + radius,
+                FastColor{
+                    64U, 208U, 224U,
+                    static_cast<std::uint8_t>(
+                        128U + (energy >> 9U))},
+                state.alpha);
+        }
+
+        const ActiveTouchHold& hold =
+            state.touch_holds[sensor];
+        if (hold.present && hold.end_tick > tick) {
+            const std::uint32_t remaining =
+                hold.end_tick - tick;
+            const int arm =
+                2 + static_cast<int>(
+                        (static_cast<std::uint64_t>(remaining) * 5U) /
+                        std::max<std::uint32_t>(1U, max_tick));
+            const FastColor color{64U, 240U, 192U, 224U};
+            fast_rectangle(
+                output, x - arm, y, x + arm, y,
+                color, state.alpha);
+            fast_rectangle(
+                output, x, y - arm, x, y + arm,
+                color, state.alpha);
+        }
+
+        if (state.touches[sensor].present) {
+            const FastColor color =
+                state.touches[sensor].hold
+                    ? FastColor{96U, 255U, 176U, 240U}
+                    : FastColor{96U, 224U, 255U, 240U};
+            fast_blend_canvas(output, x, y, color, state.alpha);
+            fast_blend_canvas(output, x - 1, y, color, state.alpha);
+            fast_blend_canvas(output, x + 1, y, color, state.alpha);
+            fast_blend_canvas(output, x, y - 1, color, state.alpha);
+            fast_blend_canvas(output, x, y + 1, color, state.alpha);
+        }
+    }
+
+    for (std::size_t lane = 0U; lane < 8U; ++lane) {
+        if (state.taps[lane].present) {
+            const int x = lane_xs[lane];
+            fast_rectangle(
+                output, x - 3, 71, x + 3, 73,
+                fast_gray(
+                    208U + (state.taps[lane].strength >> 4U)),
+                state.alpha);
+        }
+    }
+
+    for (std::size_t lane = 0U; lane < 8U; ++lane) {
+        if (!state.breaks[lane].present) {
+            continue;
+        }
+        const int x = lane_xs[lane];
+        const FastColor color =
+            fast_gray(
+                240U + (state.breaks[lane].strength >> 6U));
+        fast_rectangle(
+            output, x - 4, 48, x + 4, 48,
+            color, state.alpha);
+
+        if (state.breaks[lane].flash_frames > 0U) {
+            fast_blend_canvas(output, x, 44, color, state.alpha);
+            fast_blend_canvas(output, x, 45, color, state.alpha);
+            fast_blend_canvas(output, x, 46, color, state.alpha);
+            fast_blend_canvas(output, x, 47, color, state.alpha);
+            fast_blend_canvas(output, x, 49, color, state.alpha);
+            fast_blend_canvas(output, x, 50, color, state.alpha);
+            fast_blend_canvas(output, x, 51, color, state.alpha);
+            fast_blend_canvas(output, x, 52, color, state.alpha);
+        }
+    }
+
+    std::uint8_t break_flash_frames = 0U;
+    for (const LatestBreak& note_break : state.breaks) {
+        break_flash_frames =
+            std::max(break_flash_frames, note_break.flash_frames);
+    }
+    if (break_flash_frames > 0U) {
+        const FastColor color =
+            fast_gray(224U + break_flash_frames);
+        fast_rectangle(
+            output, 0, 0, kCanvasWidth - 1, 0,
+            color, state.alpha);
+        fast_rectangle(
+            output, 0, kCanvasHeight - 1,
+            kCanvasWidth - 1, kCanvasHeight - 1,
+            color, state.alpha);
+        fast_rectangle(
+            output, 0, 1, 0, kCanvasHeight - 2,
+            color, state.alpha);
+        fast_rectangle(
+            output, kCanvasWidth - 1, 1,
+            kCanvasWidth - 1, kCanvasHeight - 2,
+            color, state.alpha);
+    }
+
+    if (state.warning_count > 0U) {
+        const FastColor color =
+            fast_gray(
+                192U + 16U * state.latest_warning_severity);
+        const std::uint32_t limit =
+            std::min<std::uint32_t>(
+                kCanvasWidth, state.warning_count);
+        for (std::uint32_t x = 0U; x < limit; ++x) {
+            fast_blend_canvas(
+                output, static_cast<int>(x), 0,
+                color, state.alpha);
+        }
+    }
+
+    for (std::size_t j = 0U; j < 8U; ++j) {
+        const std::uint8_t byte =
+            static_cast<std::uint8_t>(
+                (state.phase >> (8U * j)) & 0xffU);
+        fast_rectangle(
+            output,
+            static_cast<int>(8U + j),
+            143 - (byte % 16U),
+            static_cast<int>(9U + j),
+            144 - (byte % 16U),
+            fast_gray(32U + (byte % 224U)),
+            state.alpha);
+    }
+}
+
 }  // namespace
 
 #if defined(__GNUC__)
@@ -1117,12 +1514,23 @@ void process_chart(
             render_chart = &parsed_chart;
         }
 
-        render_output_rgba_into(
-            chart_id, *render_chart, states.frame_begin,
-            kFirstSampleFrame, begin_payload);
-        render_output_rgba_into(
-            chart_id, *render_chart, states.frame_end,
-            kLastSampleFrame, end_payload);
+        if (fast) [[likely]] {
+            fast_render_output(
+                chart_id, fast_chart.max_tick,
+                states.frame_begin, kFirstSampleFrame,
+                begin_payload);
+            fast_render_output(
+                chart_id, fast_chart.max_tick,
+                states.frame_end, kLastSampleFrame,
+                end_payload);
+        } else {
+            render_output_rgba_into(
+                chart_id, *render_chart, states.frame_begin,
+                kFirstSampleFrame, begin_payload);
+            render_output_rgba_into(
+                chart_id, *render_chart, states.frame_end,
+                kLastSampleFrame, end_payload);
+        }
 
         std::array<std::uint8_t, kSerializedStateBytes> serialized_state{};
         serialize_state_into(states.frame_end, serialized_state);
