@@ -42,6 +42,8 @@ struct BHFastPoint {
   Block *b;
   int det, th, ph;
   double x[3];
+  int inds[3];
+  double coef[6 * ghost_width];
 };
 
 struct BHFastCache {
@@ -83,6 +85,40 @@ struct BHBounds { Block *b; double lo[3],hi[3]; };
 static bool bh_owns(const BHBounds &bb,const double p[3],const double h[3]) {
   for(int d=0;d<3;++d)
     if(p[d]-bb.lo[d] < -0.5*h[d] || p[d]-bb.hi[d] > 0.5*h[d]) return false;
+  return true;
+}
+
+static bool bh_prepare_interp(BHFastPoint &p,Block *b,const double x[3],
+                              int ord,int sym) {
+  if(ord<2 || ord>2*ghost_width) return false;
+  double xa[2*ghost_width], ya[2*ghost_width];
+  for(int q=0;q<ord;++q) xa[q]=(double)q;
+
+  for(int d=0;d<3;++d) {
+    if(!b->X[d] || b->shape[d]<ord) return false;
+    const double h=b->X[d][1]-b->X[d][0];
+    int ci=(int)((x[d]-b->X[d][0])/h+0.4)+1; // Fortran 1-based
+    int cb=ci-ord/2+1;
+    int ct=cb+ord-1;
+    int cmin=1, cmax=b->shape[d];
+    if(sym==2 && d<2 && fabs(b->X[d][0])<h) cmin=-ord/2+2;
+    if(sym!=0 && d==2 && fabs(b->X[d][0])<h) cmin=-ord/2+2;
+    if(cb<cmin){cb=cmin;ct=cb+ord-1;}
+    if(ct>cmax){ct=cmax;cb=ct+1-ord;}
+
+    double cx;
+    if(cb>0) cx=(x[d]-b->X[d][cb-1])/h;
+    else     cx=(x[d]+b->X[d][1-cb])/h;
+
+    p.inds[d]=cb-1; // f_global_interpind expects C-style start index
+    for(int basis=0;basis<ord;++basis) {
+      for(int q=0;q<ord;++q) ya[q]=(q==basis)?1.0:0.0;
+      double xq=cx, yq=0.0, dy=0.0;
+      int oq=ord;
+      f_polint(xa,ya,xq,yq,dy,oq);
+      p.coef[d*ord+basis]=yq;
+    }
+  }
   return true;
 }
 
@@ -142,7 +178,9 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       for(size_t k=0;k<bs.size();++k)if(bh_owns(bs[k],x,h)){own=bs[k].b;break;}
       if(!own)return false;if(own->rank!=rank)continue;
       BHFastPoint p;p.b=own;p.det=d;p.th=n/nph;p.ph=n-p.th*nph;
-      p.x[0]=x[0];p.x[1]=x[1];p.x[2]=x[2];c.pts.push_back(p);
+      p.x[0]=x[0];p.x[1]=x[1];p.x[2]=x[2];
+      if(!bh_prepare_interp(p,own,x,c.ord,sym)) return false;
+      c.pts.push_back(p);
     }}
   c.fourier.assign((size_t)c.ndet*nth*c.nm*4,0.0);
   c.local.assign((size_t)c.ndet*c.modes*2,0.0);
@@ -155,13 +193,15 @@ static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   std::fill(c.local.begin(),c.local.end(),0.0);
   for(size_t z=0;z<c.pts.size();++z){const BHFastPoint &p=c.pts[z];
     double rr=0.0,ii=0.0;
-    int sym=1;
+    int sym=1, sst=-1;
     double xx=p.x[0],yy=p.x[1],zz=p.x[2];
-    f_global_interp(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
-                    p.b->fgfs[rp->sgfn],rr,xx,yy,zz,c.ord,rp->SoA,sym);
+    f_global_interpind(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
+                       p.b->fgfs[rp->sgfn],rr,xx,yy,zz,c.ord,rp->SoA,sym,
+                       p.inds,p.coef,sst);
     xx=p.x[0];yy=p.x[1];zz=p.x[2];
-    f_global_interp(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
-                    p.b->fgfs[ip->sgfn],ii,xx,yy,zz,c.ord,ip->SoA,sym);
+    f_global_interpind(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
+                       p.b->fgfs[ip->sgfn],ii,xx,yy,zz,c.ord,ip->SoA,sym,
+                       p.inds,p.coef,sst);
     size_t tr=(size_t)p.ph*c.nm;
     for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
       double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
