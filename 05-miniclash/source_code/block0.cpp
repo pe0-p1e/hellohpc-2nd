@@ -4,6 +4,7 @@
 #include <immintrin.h>
 #endif
 #include "main.hpp"
+#include "simd_q1.hpp"
 
 thread_local uint32 seed32_1, seed32_2;
 thread_local const std::atomic<bool>* miniclash_cancel_flag = nullptr;
@@ -127,6 +128,28 @@ void find_block0(uint32 block[], const uint32 IV[])
 		const uint32 tt5 = RR(Q[Qoff + 6] - Q[Qoff + 5], 12) - FF(Q[Qoff + 5], Q[Qoff + 4], Q[Qoff + 3]) - 0x4787c62a;
 
 		// change q17 until conditions are met on q18, q19 and q20
+#if defined(__AVX512F__)
+		miniclash_block0_q17_result q17r;
+		if (!miniclash_find_block0_q17_avx512(
+				Q[Qoff + 16], Q[Qoff + 15], tt18, tt19, tt20, q17r))
+			continue;
+
+		const uint32 q16 = Q[Qoff + 16];
+		block[1] = q17r.q17 - q16;
+		block[1] = RR(block[1], 5);
+		block[1] -= tt17;
+		uint32 q2 = block[1] + tt1;
+		q2 = RL(q2, 12);
+		q2 += Q[Qoff + 1];
+		block[5] = tt5 - q2;
+
+		Q[Qoff + 2] = q2;
+		Q[Qoff + 17] = q17r.q17;
+		Q[Qoff + 18] = q17r.q18;
+		Q[Qoff + 19] = q17r.q19;
+		Q[Qoff + 20] = q17r.q20;
+		MD5_REVERSE_STEP(2, 0x242070db, 17);
+#else
 		unsigned counter = 0;
 		while (counter < (1 << 7))
 		{
@@ -165,6 +188,7 @@ void find_block0(uint32 block[], const uint32 IV[])
 		}
 		if (counter != 0)
 			continue;
+#endif
 
 		const uint32 q4 = Q[Qoff + 4];
 		const uint32 q9backup = Q[Qoff + 9];
