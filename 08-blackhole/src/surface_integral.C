@@ -48,6 +48,9 @@ struct BHFastPoint {
   int piy[2 * ghost_width];
   int piz[2 * ghost_width];
   unsigned char zref[2 * ghost_width];
+  int row_base[4 * ghost_width * ghost_width];
+  double row_wR[4 * ghost_width * ghost_width];
+  double row_wI[4 * ghost_width * ghost_width];
 };
 
 struct BHFastCache {
@@ -157,50 +160,67 @@ static bool bh_prepare_interp(BHFastPoint &p,Block *b,const double x[3],
     p.zref[q]=(lz<=0)?1:0;
   }
 #endif
+  {
+    int r=0;
+    const int nx=b->shape[0], nxy=nx*b->shape[1];
+    for(int iz=0;iz<ord;++iz) {
+      const double wz=p.coef[2*ord+iz];
+      const double zsgn=p.zref[iz] ? -1.0 : 1.0;
+      for(int iy=0;iy<ord;++iy) {
+        p.row_base[r]=p.pix[0]+p.piy[iy]*nx+p.piz[iz]*nxy;
+        const double wyz=p.coef[ord+iy]*wz;
+        p.row_wR[r]=wyz;
+        p.row_wI[r]=wyz*zsgn;
+        ++r;
+      }
+    }
+  }
   return true;
 }
 
-static inline void bh_interp_pair(const BHFastPoint &p,int ord,
-                                  const double *R,const double *I,
-                                  double iz_parity,double &rr,double &ii) {
-  const int nx=p.b->shape[0];
-  const int nxy=nx*p.b->shape[1];
-  double zyR[2*ghost_width][2*ghost_width];
-  double zyI[2*ghost_width][2*ghost_width];
-  double yR[2*ghost_width], yI[2*ghost_width];
-
-  const double *wz=&p.coef[2*ord];
-  const double *wy=&p.coef[ord];
+template<int ORD>
+static inline void bh_interp_pair_fixed(const BHFastPoint &p,
+                                        const double *__restrict R,
+                                        const double *__restrict I,
+                                        double &rr,double &ii) {
   const double *wx=&p.coef[0];
-
-  // Same contraction order as Fortran global_interpind: z -> y -> x.
-  for(int ix=0;ix<ord;++ix) {
-    const int bx=p.pix[ix];
-    for(int iy=0;iy<ord;++iy) {
-      const int bxy=bx+p.piy[iy]*nx;
-      double sr=0.0,si=0.0;
-      for(int iz=0;iz<ord;++iz) {
-        const int at=bxy+p.piz[iz]*nxy;
-        const double w=wz[iz];
-        sr += w*R[at];
-        si += w*(p.zref[iz]?iz_parity:1.0)*I[at];
-      }
-      zyR[ix][iy]=sr;
-      zyI[ix][iy]=si;
-    }
-  }
-  for(int ix=0;ix<ord;++ix) {
-    double sr=0.0,si=0.0;
-    for(int iy=0;iy<ord;++iy) {
-      sr += wy[iy]*zyR[ix][iy];
-      si += wy[iy]*zyI[ix][iy];
-    }
-    yR[ix]=sr; yI[ix]=si;
-  }
   rr=0.0; ii=0.0;
-  for(int ix=0;ix<ord;++ix) {
-    rr += wx[ix]*yR[ix];
-    ii += wx[ix]*yI[ix];
+  int row=0;
+  for(int iz=0;iz<ORD;++iz) {
+    for(int iy=0;iy<ORD;++iy,++row) {
+      const double *rptr=R+p.row_base[row];
+      const double *iptr=I+p.row_base[row];
+      double xr=0.0, xi=0.0;
+      for(int ix=0;ix<ORD;++ix) {
+        const double w=wx[ix];
+        xr += w*rptr[ix];
+        xi += w*iptr[ix];
+      }
+      rr += p.row_wR[row]*xr;
+      ii += p.row_wI[row]*xi;
+    }
+  }
+}
+
+static inline void bh_interp_pair(const BHFastPoint &p,int ord,
+                                  const double *__restrict R,
+                                  const double *__restrict I,
+                                  double iz_parity,double &rr,double &ii) {
+  (void)iz_parity;
+  if(ord==6) bh_interp_pair_fixed<6>(p,R,I,rr,ii);
+  else if(ord==4) bh_interp_pair_fixed<4>(p,R,I,rr,ii);
+  else {
+    rr=0.0; ii=0.0;
+    const double *wx=&p.coef[0];
+    int row=0;
+    for(int iz=0;iz<ord;++iz)
+      for(int iy=0;iy<ord;++iy,++row) {
+        const double *rptr=R+p.row_base[row];
+        const double *iptr=I+p.row_base[row];
+        double xr=0.0,xi=0.0;
+        for(int ix=0;ix<ord;++ix){xr+=wx[ix]*rptr[ix];xi+=wx[ix]*iptr[ix];}
+        rr+=p.row_wR[row]*xr; ii+=p.row_wI[row]*xi;
+      }
   }
 }
 
