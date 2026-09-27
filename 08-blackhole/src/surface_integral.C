@@ -50,6 +50,15 @@ struct BHFastPoint {
   unsigned char zref[2 * ghost_width];
 };
 
+struct BHFullDet {
+  std::vector<const double*> raddr, iaddr;
+  std::vector<double> rr, ri, ir, ii;
+};
+struct BHBlockIdMap {
+  Block *b;
+  std::vector<int> id;
+};
+
 struct BHFastCache {
   bool configured, ready, valid;
   int lev, maxl, modes, ndet, ord, nth, nph, nm;
@@ -58,6 +67,7 @@ struct BHFastCache {
   std::vector<double> radii, cphi, sphi, thetaA, thetaB;
   std::vector<int> ml, mm;
   std::vector<BHFastPoint> pts;
+  std::vector<BHFullDet> fullop;
   std::vector<double> fourier, local, global;
   BHFastCache():configured(false),ready(false),valid(false),lev(-1),maxl(0),
     modes(0),ndet(0),ord(0),nth(0),nph(0),nm(0),rmax(0),dr(0),gh(NULL){}
@@ -306,31 +316,136 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.fourier.assign((size_t)c.ndet*nth*c.nm*4,0.0);
   c.local.assign((size_t)c.ndet*c.modes*2,0.0);
   c.global.assign((size_t)c.ndet*c.modes*2,0.0);
+
+  // Build the complete local grid -> mode linear operator.
+  // Geometry is fixed across iterations; only field values are read in bh_eval().
+  // A direct per-Block integer map replaces the previous hash-heavy construction.
+  c.fullop.clear();
+  c.fullop.resize(c.ndet);
+
+  for(int d=0; d<c.ndet; ++d) {
+    BHFullDet &op=c.fullop[d];
+    std::vector<BHBlockIdMap> maps;
+
+    // First pass: enumerate unique physical grid cells touched by this detector.
+    for(size_t pp=0; pp<c.pts.size(); ++pp) {
+      const BHFastPoint &p=c.pts[pp];
+      if(p.det!=d) continue;
+
+      int bm=-1;
+      for(size_t k=0;k<maps.size();++k) if(maps[k].b==p.b){bm=(int)k;break;}
+      if(bm<0) {
+        BHBlockIdMap mm;
+        mm.b=p.b;
+        size_t nv=(size_t)p.b->shape[0]*p.b->shape[1]*p.b->shape[2];
+        mm.id.assign(nv,-1);
+        maps.push_back(mm);
+        bm=(int)maps.size()-1;
+      }
+
+      std::vector<int> &imap=maps[bm].id;
+      const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+      for(int iz=0; iz<c.ord; ++iz)
+        for(int iy=0; iy<c.ord; ++iy)
+          for(int ix=0; ix<c.ord; ++ix) {
+            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            if(imap[at]<0) {
+              imap[at]=(int)op.raddr.size();
+              op.raddr.push_back(p.b->fgfs[rp->sgfn]+at);
+              op.iaddr.push_back(p.b->fgfs[ip->sgfn]+at);
+            }
+          }
+    }
+
+    const size_t nc=op.raddr.size();
+    const size_t nw=nc*(size_t)c.modes;
+    op.rr.assign(nw,0.0);
+    op.ri.assign(nw,0.0);
+    op.ir.assign(nw,0.0);
+    op.ii.assign(nw,0.0);
+
+    // Second pass: fold interpolation, phi Fourier, theta quadrature and
+    // spherical-harmonic projection into four coefficient streams.
+    for(size_t pp=0; pp<c.pts.size(); ++pp) {
+      const BHFastPoint &p=c.pts[pp];
+      if(p.det!=d) continue;
+
+      int bm=-1;
+      for(size_t k=0;k<maps.size();++k) if(maps[k].b==p.b){bm=(int)k;break;}
+      if(bm<0) return false;
+      const std::vector<int> &imap=maps[bm].id;
+
+      const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
+      const double radius=c.radii[d];
+      const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
+
+      for(int iz=0; iz<c.ord; ++iz) {
+        const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
+        for(int iy=0; iy<c.ord; ++iy) {
+          const double wyz=wy[iy]*wz[iz];
+          for(int ix=0; ix<c.ord; ++ix) {
+            const double wR=wx[ix]*wyz;
+            const double wI=wR*izsgn;
+            const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            const int id=imap[at];
+            if(id<0) return false;
+            const size_t base=(size_t)id*c.modes;
+
+            for(int q=0; q<c.modes; ++q) {
+              const int m=c.mm[q], ma=abs(m);
+              const double ss=m<0 ? -1.0 : 1.0;
+              const double cs=c.cphi[(size_t)p.ph*c.nm+ma];
+              const double sn=c.sphi[(size_t)p.ph*c.nm+ma];
+              const double A=c.thetaA[(size_t)q*c.nth+p.th];
+              const double B=c.thetaB[(size_t)q*c.nth+p.th];
+
+              op.rr[base+q] += wR*(radius*A*cs);
+              op.ri[base+q] += wI*(radius*B*ss*sn);
+              op.ir[base+q] += wR*(-radius*A*ss*sn);
+              op.ii[base+q] += wI*(radius*B*cs);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  c.pts.clear();
+  c.pts.shrink_to_fit();
+  c.fourier.clear();
+  c.fourier.shrink_to_fit();
   c.valid=true;return true;
 }
 
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
-  std::fill(c.fourier.begin(),c.fourier.end(),0.0);
+  (void)rp; (void)ip;
   std::fill(c.local.begin(),c.local.end(),0.0);
-  for(size_t z=0;z<c.pts.size();++z){BHFastPoint &p=c.pts[z];
-    double rr=0.0,ii=0.0;
-    bh_interp_pair(p,c.ord,
-                   p.b->fgfs[rp->sgfn],p.b->fgfs[ip->sgfn],
-                   ip->SoA[2],rr,ii);
-    size_t tr=(size_t)p.ph*c.nm;
-    for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
-      double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
-      f[0]+=rr*cs;f[1]+=rr*sn;f[2]+=ii*cs;f[3]+=ii*sn;}
+
+  for(int d=0; d<c.ndet; ++d) {
+    const BHFullDet &op=c.fullop[d];
+    double *outR=&c.local[(size_t)d*c.modes*2];
+    double *outI=outR+c.modes;
+    const size_t nc=op.raddr.size();
+
+    for(size_t j=0;j<nc;++j) {
+      const double rv=*op.raddr[j];
+      const double iv=*op.iaddr[j];
+      const size_t base=j*(size_t)c.modes;
+      const double *__restrict crr=&op.rr[base];
+      const double *__restrict cri=&op.ri[base];
+      const double *__restrict cir=&op.ir[base];
+      const double *__restrict cii=&op.ii[base];
+
+      #pragma GCC ivdep
+      for(int q=0;q<c.modes;++q) {
+        outR[q] += crr[q]*rv + cri[q]*iv;
+        outI[q] += cir[q]*rv + cii[q]*iv;
+      }
+    }
   }
-  for(int d=0;d<c.ndet;++d){double *out=&c.local[(size_t)d*c.modes*2];double r=c.radii[d];
-    for(int q=0;q<c.modes;++q){int m=c.mm[q],ma=abs(m);double ss=m<0?-1.0:1.0,ar=0,ai=0;
-      const double *A=&c.thetaA[(size_t)q*c.nth],*B=&c.thetaB[(size_t)q*c.nth];
-      for(int t=0;t<c.nth;++t){const double *f=&c.fourier[bh_fidx(c,d,t,ma,0)];
-        double rc=f[0],rs=ss*f[1],ic=f[2],is=ss*f[3];
-        ar+=A[t]*rc+B[t]*is;ai+=B[t]*ic-A[t]*rs;}
-      out[q]=ar*r;out[c.modes+q]=ai*r;
-    }}
-  MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
+
+  MPI_Reduce(c.local.data(),c.global.data(),(int)c.local.size(),
+             MPI_DOUBLE,MPI_SUM,0,MPI_COMM_WORLD);
   c.ready=true;
 }
 }
