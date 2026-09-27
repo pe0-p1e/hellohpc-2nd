@@ -101,14 +101,26 @@ static bool bh_prepare_interp(BHFastPoint &p,Block *b,const double x[3],
     int cb=ci-ord/2+1;
     int ct=cb+ord-1;
     int cmin=1, cmax=b->shape[d];
+#ifdef Cell
+    if(sym==2 && d<2 && fabs(b->X[d][0])<h) cmin=-ord/2+1;
+    if(sym!=0 && d==2 && fabs(b->X[d][0])<h) cmin=-ord/2+1;
+#else
     if(sym==2 && d<2 && fabs(b->X[d][0])<h) cmin=-ord/2+2;
     if(sym!=0 && d==2 && fabs(b->X[d][0])<h) cmin=-ord/2+2;
+#endif
     if(cb<cmin){cb=cmin;ct=cb+ord-1;}
     if(ct>cmax){ct=cmax;cb=ct+1-ord;}
 
     double cx;
-    if(cb>0) cx=(x[d]-b->X[d][cb-1])/h;
-    else     cx=(x[d]+b->X[d][1-cb])/h;
+    if(cb>0) {
+      cx=(x[d]-b->X[d][cb-1])/h;
+    } else {
+#ifdef Cell
+      cx=(x[d]+b->X[d][-cb])/h;
+#else
+      cx=(x[d]+b->X[d][1-cb])/h;
+#endif
+    }
 
     p.inds[d]=cb-1; // f_global_interpind expects C-style start index
     for(int basis=0;basis<ord;++basis) {
