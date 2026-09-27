@@ -1,4 +1,3 @@
-#include <iostream>
 #include <vector>
 #include "main.hpp"
 
@@ -256,7 +255,6 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 						return;
 
 					if (IV2[0] != IV1[0])
-						std::cout << "!" << std::flush;
 				}
 			}
 		}
