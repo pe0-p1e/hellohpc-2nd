@@ -42,7 +42,7 @@ using namespace std;
 namespace {
 struct BHFastPoint {
   Block *b;
-  int det, th, ph;
+  int det, th, ph, bid;
   double x[3];
   int inds[3];
   double coef[6 * ghost_width];
@@ -81,6 +81,7 @@ struct BHFastCache {
   std::vector<double> radii, cphi, sphi, thetaA, thetaB;
   std::vector<int> ml, mm;
   std::vector<BHFastPoint> pts;
+  std::vector<Block*> local_blocks;
   std::vector<std::vector<BHFourierRow> > fop;
   std::vector<double> fourier, local, global;
   BHFastCache():configured(false),ready(false),valid(false),lev(-1),maxl(0),
@@ -316,6 +317,17 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       bb.hi[d]=feq(b->bbox[3+d],pa->bbox[3+d],h[d]/2)?b->bbox[3+d]-pa->uui[d]*h[d]:b->bbox[3+d]-ghost_width*h[d];
 #endif
     }bs.push_back(bb);if(bp==pa->ble)break;}
+
+  c.local_blocks.clear();
+  std::map<Block*,int> local_bid;
+  for(size_t k=0;k<bs.size();++k) {
+    if(bs[k].b->rank==rank) {
+      int id=(int)c.local_blocks.size();
+      local_bid[bs[k].b]=id;
+      c.local_blocks.push_back(bs[k].b);
+    }
+  }
+
   int world=1;MPI_Comm_size(MPI_COMM_WORLD,&world);
   c.pts.clear();c.pts.reserve(((size_t)ntot*c.ndet+world-1)/world*2+64);
   for(int d=0;d<c.ndet;++d){double r=c.radii[d];
@@ -323,6 +335,7 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       for(size_t k=0;k<bs.size();++k)if(bh_owns(bs[k],x,h)){own=bs[k].b;break;}
       if(!own)return false;if(own->rank!=rank)continue;
       BHFastPoint p;p.b=own;p.det=d;p.th=n/nph;p.ph=n-p.th*nph;
+      p.bid=local_bid[own];
       p.x[0]=x[0];p.x[1]=x[1];p.x[2]=x[2];
       if(!bh_prepare_interp(p,own,x,c.ord,sym)) return false;
       c.pts.push_back(p);
@@ -336,9 +349,20 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
   c.fop.clear();
   c.fop.resize(c.ndet);
   for(int d=0; d<c.ndet; ++d) {
-    std::unordered_map<BHFourierKey,int,BHFourierKeyHash> ids;
     std::vector<BHFourierRow> &rows=c.fop[d];
-    ids.reserve(c.pts.size()/c.ndet * c.ord + 64);
+
+    // Direct dense id tables replace millions of unordered_map lookups during
+    // warmup.  The table is detector-local and freed before the next detector.
+    std::vector<std::vector<int> > ids(c.local_blocks.size());
+    for(size_t bi=0; bi<c.local_blocks.size(); ++bi) {
+      Block *b=c.local_blocks[bi];
+      const size_t nc=(size_t)b->shape[0]*b->shape[1]*b->shape[2];
+      ids[bi].assign(nc*c.nth,-1);
+    }
+
+    size_t detector_points=0;
+    for(size_t pp=0; pp<c.pts.size(); ++pp) if(c.pts[pp].det==d) ++detector_points;
+    rows.reserve(detector_points * c.ord);
 
     for(size_t pp=0; pp<c.pts.size(); ++pp) {
       const BHFastPoint &p=c.pts[pp];
@@ -346,6 +370,7 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
       const int nx=p.b->shape[0], nxy=nx*p.b->shape[1];
       const double *wx=&p.coef[0], *wy=&p.coef[c.ord], *wz=&p.coef[2*c.ord];
       const size_t tr=(size_t)p.ph*c.nm;
+      std::vector<int> &idtab=ids[p.bid];
 
       for(int iz=0; iz<c.ord; ++iz) {
         const double izsgn=p.zref[iz] ? ip->SoA[2] : 1.0;
@@ -354,19 +379,18 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
           for(int ix=0; ix<c.ord; ++ix) {
             const double wR=wx[ix]*wyz;
             const double wI=wR*izsgn;
-            int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
-            BHFourierKey key={p.b,at,p.th};
-            int id;
-            std::unordered_map<BHFourierKey,int,BHFourierKeyHash>::iterator it=ids.find(key);
-            if(it==ids.end()) {
+            const int at=p.pix[ix]+p.piy[iy]*nx+p.piz[iz]*nxy;
+            const size_t slot=(size_t)at*c.nth+p.th;
+            int id=idtab[slot];
+            if(id<0) {
               id=(int)rows.size();
-              ids.insert(std::make_pair(key,id));
+              idtab[slot]=id;
               BHFourierRow row;
               row.b=p.b; row.idx=at; row.th=p.th;
               for(int m=0;m<(int)(2*ghost_width+4);++m)
                 row.wc[m]=row.ws[m]=row.wic[m]=row.wis[m]=0.0;
               rows.push_back(row);
-            } else id=it->second;
+            }
 
             BHFourierRow &row=rows[id];
             for(int m=0;m<c.nm;++m) {
