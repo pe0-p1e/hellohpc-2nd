@@ -88,6 +88,7 @@ make -C src -j8 blackhole
 
 echo "===== RUN ====="
 rm -f benchmark-result.txt
+RUNLOG="${ROOT}/runs/${CASE}-${MODE}-\$SLURM_JOB_ID.run.log"
 
 if [[ "${MODE}" == "dev" ]]; then
   mpirun \
@@ -96,17 +97,19 @@ if [[ "${MODE}" == "dev" ]]; then
     --bind-to core:overload-allowed \
     --map-by core \
     -np 8 \
-    src/blackhole "configs/${CASE}.par"
+    src/blackhole "configs/${CASE}.par" 2>&1 | tee "\$RUNLOG"
 else
   mpirun \
     -np "${RUN_RANKS}" \
     --bind-to core \
     --map-by core \
-    src/blackhole "configs/${CASE}.par"
+    src/blackhole "configs/${CASE}.par" 2>&1 | tee "\$RUNLOG"
 fi
 
 echo "===== RESULT ====="
 cat benchmark-result.txt
+echo "===== BLACKHOLE ====="
+grep '^BLACKHOLE_' "\$RUNLOG"
 
 echo "===== CORRECTNESS ====="
 python3 - "${CASE}" "${MODE}" "${POINTS}" "${FULL}" "${ZERO}" <<'PY'
@@ -136,7 +139,26 @@ print(f"MAX_ABS_ERROR: {max_abs:.17g}")
 PY
 
 echo "===== PERFORMANCE ====="
-grep '^BLACKHOLE_' <(true) 2>/dev/null || true
+python3 - "\$RUNLOG" "${MODE}" "${POINTS}" "${FULL}" "${ZERO}" <<'PY'
+import pathlib, re, sys
+
+runlog, mode = sys.argv[1], sys.argv[2]
+P, F, Z = map(float, sys.argv[3:6])
+text = pathlib.Path(runlog).read_text(errors="replace")
+m = re.search(r"^BLACKHOLE_TIME max=([0-9eE+\-.]+)", text, re.M)
+if not m:
+    print("PERFORMANCE: BLACKHOLE_TIME not found")
+    raise SystemExit(0)
+
+t = float(m.group(1))
+print(f"PERFORMANCE_SECONDS: {t:.17g}")
+if mode == "official":
+    raw = F * (Z - t) / (t * (Z - F))
+    score = P * min(1.0, max(0.0, raw))
+    print(f"CASE_SCORE: {score:.6f}/{P:g}")
+else:
+    print("CASE_SCORE: dev 8-rank run; not an official score")
+PY
 echo "finished=\$(date -Is)"
 EOF
 
@@ -150,7 +172,7 @@ echo "Mode: $MODE"
 echo "Watch:"
 echo "  squeue -j $jid"
 echo "After completion:"
-echo "  grep -E '^BLACKHOLE_|OVERALL|MAX_ABS_ERROR' runs/${CASE}-${MODE}-${jid}.out"
+echo "  grep -E '^BLACKHOLE_|OVERALL|MAX_ABS_ERROR|PERFORMANCE_SECONDS|CASE_SCORE' runs/${CASE}-${MODE}-${jid}.out"
 echo "  cat runs/${CASE}-${MODE}-${jid}.err"
 
 if [[ "$MODE" == "official" ]]; then
