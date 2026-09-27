@@ -11,6 +11,7 @@ constexpr uint32_t kAlignment = 8;
 // FP32 x elements is 64 KiB (plus 32 KiB for the FP16 source), which still
 // leaves room for score/reduction and moment scratch on 910B3.
 constexpr uint32_t kXTileElements = 16384;
+constexpr uint32_t kVarianceGroupRows = 8;
 
 class ComputeCore {
 public:
@@ -89,7 +90,11 @@ private:
 
     __aicore__ inline uint32_t RowsPerXTile() const
     {
-        return kXTileElements / d_;
+        // Keep streaming tile boundaries aligned with the baseline's 8-row
+        // variance accumulation groups so the FP32 summation order remains
+        // conservative on adversarial precision cases.
+        const uint32_t rows = kXTileElements / d_;
+        return (rows / kVarianceGroupRows) * kVarianceGroupRows;
     }
 
     __aicore__ inline void LoadScores(
@@ -247,14 +252,21 @@ private:
         auto mean = mean_buffer_.Get<float>();
         auto m2 = m2_buffer_.Get<float>();
         auto temp = temp_buffer_.Get<float>();
+        auto chunk = variance_chunk_buffer_.Get<float>();
         auto x_float = x_float_buffer_.Get<float>();
         auto score_float = score_float_buffer_.Get<float>();
         AscendC::Duplicate(m2, 0.0f, d_);
-        for (uint32_t row = 0; row < rows; ++row) {
-            AscendC::Sub(temp, x_float[row * d_], mean, d_);
-            AscendC::Mul(temp, temp, temp, d_);
-            AscendC::Muls(temp, temp, score_float.GetValue(row), d_);
-            AscendC::Add(m2, m2, temp, d_);
+        for (uint32_t row_base = 0; row_base < rows; row_base += kVarianceGroupRows) {
+            const uint32_t group_rows = Minimum(kVarianceGroupRows, rows - row_base);
+            AscendC::Duplicate(chunk, 0.0f, d_);
+            for (uint32_t row = 0; row < group_rows; ++row) {
+                const uint32_t index = row_base + row;
+                AscendC::Sub(temp, x_float[index * d_], mean, d_);
+                AscendC::Mul(temp, temp, temp, d_);
+                AscendC::Muls(temp, temp, score_float.GetValue(index), d_);
+                AscendC::Add(chunk, chunk, temp, d_);
+            }
+            AscendC::Add(m2, m2, chunk, d_);
         }
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -352,14 +364,21 @@ private:
         for (uint32_t row_base = 0; row_base < rows; row_base += rows_per_tile) {
             const uint32_t tile_rows = Minimum(rows_per_tile, rows - row_base);
             LoadRows(begin + row_base, tile_rows);
-            AscendC::Duplicate(chunk, 0.0f, d_);
-            for (uint32_t row = 0; row < tile_rows; ++row) {
-                AscendC::Sub(temp, x_float[row * d_], mean, d_);
-                AscendC::Mul(temp, temp, temp, d_);
-                AscendC::Muls(temp, temp, score_float.GetValue(row_base + row), d_);
-                AscendC::Add(chunk, chunk, temp, d_);
+            for (uint32_t group_base = 0; group_base < tile_rows;
+                 group_base += kVarianceGroupRows) {
+                const uint32_t group_rows =
+                    Minimum(kVarianceGroupRows, tile_rows - group_base);
+                AscendC::Duplicate(chunk, 0.0f, d_);
+                for (uint32_t row = 0; row < group_rows; ++row) {
+                    const uint32_t local_row = group_base + row;
+                    AscendC::Sub(temp, x_float[local_row * d_], mean, d_);
+                    AscendC::Mul(temp, temp, temp, d_);
+                    AscendC::Muls(temp, temp,
+                        score_float.GetValue(row_base + local_row), d_);
+                    AscendC::Add(chunk, chunk, temp, d_);
+                }
+                AscendC::Add(m2, m2, chunk, d_);
             }
-            AscendC::Add(m2, m2, chunk, d_);
             AscendC::PipeBarrier<PIPE_V>();
         }
     }
@@ -467,14 +486,21 @@ private:
             for (uint32_t row_base = 0; row_base < count; row_base += rows_per_tile) {
                 const uint32_t rows = Minimum(rows_per_tile, count - row_base);
                 LoadRows(base + row_base, rows);
-                AscendC::Duplicate(chunk, 0.0f, d_);
-                for (uint32_t row = 0; row < rows; ++row) {
-                    AscendC::Sub(temp, x_float[row * d_], mean, d_);
-                    AscendC::Mul(temp, temp, temp, d_);
-                    AscendC::Muls(temp, temp, score_float.GetValue(row_base + row), d_);
-                    AscendC::Add(chunk, chunk, temp, d_);
+                for (uint32_t group_base = 0; group_base < rows;
+                     group_base += kVarianceGroupRows) {
+                    const uint32_t group_rows =
+                        Minimum(kVarianceGroupRows, rows - group_base);
+                    AscendC::Duplicate(chunk, 0.0f, d_);
+                    for (uint32_t row = 0; row < group_rows; ++row) {
+                        const uint32_t local_row = group_base + row;
+                        AscendC::Sub(temp, x_float[local_row * d_], mean, d_);
+                        AscendC::Mul(temp, temp, temp, d_);
+                        AscendC::Muls(temp, temp,
+                            score_float.GetValue(row_base + local_row), d_);
+                        AscendC::Add(chunk, chunk, temp, d_);
+                    }
+                    AscendC::Add(m2, m2, chunk, d_);
                 }
-                AscendC::Add(m2, m2, chunk, d_);
                 AscendC::PipeBarrier<PIPE_V>();
             }
         }
