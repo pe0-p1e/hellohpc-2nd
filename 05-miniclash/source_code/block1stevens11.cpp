@@ -4,6 +4,7 @@
 #include <immintrin.h>
 #endif
 #include "main.hpp"
+#include "simd_q1.hpp"
 
 
 static inline __attribute__((always_inline)) bool finish_stevens_candidate(
@@ -108,6 +109,24 @@ void find_block1_stevens_11(uint32 block[], const uint32 IV[])
 
 		const uint32 q1a = 0x02000861 ^ (Q[Qoff + 0] & 0x80000020);
 		
+#if defined(__AVX512F__)
+		miniclash_q1_result q1r;
+		if (!miniclash_find_q1_avx512<true>(
+				q1a, 0x7dfff79eu, Q, tt0, tt1, tt17, tt18, tt19,
+				0xc0008008u, 0x40000000u,
+				0x80020000u, 0x80000000u, q1r))
+			continue;
+
+		Q[Qoff + 1] = q1r.q1;
+		Q[Qoff + 17] = q1r.q17;
+		Q[Qoff + 18] = q1r.q18;
+		Q[Qoff + 19] = q1r.q19;
+		Q[Qoff + 20] = q1r.q20;
+		Q[Qoff + 21] = q1r.q21;
+		block[0] = q1r.m0;
+		block[1] = q1r.m1;
+		block[5] = q1r.block5;
+#else
 		unsigned counter = 0;
 		while (counter < (1 << 12))
 		{
@@ -159,6 +178,7 @@ void find_block1_stevens_11(uint32 block[], const uint32 IV[])
 		}
 		if (counter != 0)
 			continue;
+#endif
 
 		const uint32 q9b = Q[Qoff + 9];
 		const uint32 q10b = Q[Qoff + 10];
