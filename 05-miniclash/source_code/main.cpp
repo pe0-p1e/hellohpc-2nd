@@ -524,8 +524,8 @@ int run_batch(const std::string& tasks_file)
 			continue;
 		}
 
-		if (std::rename(winner.tmp1.c_str(), task.out1.c_str()) != 0
-			|| std::rename(winner.tmp2.c_str(), task.out2.c_str()) != 0)
+		if (::rename(winner.tmp1.c_str(), task.out1.c_str()) != 0
+			|| ::rename(winner.tmp2.c_str(), task.out2.c_str()) != 0)
 		{
 			perror("rename");
 			release_attempt(pid, true, false, true);
