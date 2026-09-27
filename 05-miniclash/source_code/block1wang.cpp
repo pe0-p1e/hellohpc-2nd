@@ -4,6 +4,7 @@
 #include <immintrin.h>
 #endif
 #include "main.hpp"
+#include "simd_q1.hpp"
 
 
 static inline __attribute__((always_inline)) bool finish_wang_candidate(
@@ -113,6 +114,23 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 
 		const uint32 q1a = 0x04200040 | (Q[Qoff + 2] & 0xf01e1080);
 		
+#if defined(__AVX512F__)
+		miniclash_q1_result q1r;
+		if (!miniclash_find_q1_avx512<false>(
+				q1a, 0x01c0e71fu, Q, tt0, tt1, tt17, tt18, tt19,
+				0xc0008008u, 0x40000000u,
+				0x00020000u, 0x00000000u, q1r))
+			continue;
+
+		Q[Qoff + 1] = q1r.q1;
+		Q[Qoff + 17] = q1r.q17;
+		Q[Qoff + 18] = q1r.q18;
+		Q[Qoff + 19] = q1r.q19;
+		Q[Qoff + 20] = q1r.q20;
+		block[0] = q1r.m0;
+		block[1] = q1r.m1;
+		MD5_REVERSE_STEP(2, 0x242070db, 17);
+#else
 		unsigned counter = 0;
 		while (counter < (1 << 12))
 		{
@@ -158,6 +176,7 @@ void find_block1_wang(uint32 block[], const uint32 IV[])
 		}
 		if (counter != 0)
 			continue;
+#endif
 
 		const uint32 q4b = Q[Qoff + 4];
 		const uint32 q9b = Q[Qoff + 9];
