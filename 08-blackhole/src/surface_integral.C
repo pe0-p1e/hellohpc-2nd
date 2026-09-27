@@ -33,6 +33,7 @@ using namespace std;
 #include "getnpem2.h"
 #include "getnp4.h"
 #include "parameters.h"
+#include "fmisc.h"
 
 #define PI M_PI
 
@@ -40,9 +41,7 @@ namespace {
 struct BHFastPoint {
   Block *b;
   int det, th, ph;
-  int idx[3][2 * ghost_width];
-  double w[3][2 * ghost_width];
-  signed char isign[2 * ghost_width];
+  double x[3];
 };
 
 struct BHFastCache {
@@ -80,65 +79,10 @@ static bool bh_read_cfg(int &L,int &nd,double &rmax,double &dr) {
   return a&&b&&c&&d;
 }
 
-static double bh_polint_basis(int n,double x,int basis) {
-  double c[2*ghost_width],d[2*ghost_width],ho[2*ghost_width];
-  for(int i=0;i<n;++i){c[i]=d[i]=(i==basis)?1.0:0.0;ho[i]=i-x;}
-  int ns=0;double dif=fabs(x);
-  for(int i=0;i<n;++i){double dt=fabs(x-i);if(dt<dif){ns=i;dif=dt;}}
-  double y=(ns==basis)?1.0:0.0;--ns;
-  for(int m=1;m<n;++m){int nn=n-m;
-    for(int i=0;i<nn;++i){double den=(c[i+1]-d[i])/(ho[i]-ho[i+m]);
-      d[i]=ho[i+m]*den;c[i]=ho[i]*den;}
-    double dy;if(2*ns<n-m)dy=c[ns+1];else{dy=d[ns];--ns;}y+=dy;
-  }
-  return y;
-}
-static void bh_lagrange(int n,double x,double *w) {
-  for(int i=0;i<n;++i) w[i]=bh_polint_basis(n,x,i);
-}
-
 struct BHBounds { Block *b; double lo[3],hi[3]; };
 static bool bh_owns(const BHBounds &bb,const double p[3],const double h[3]) {
   for(int d=0;d<3;++d)
     if(p[d]-bb.lo[d] < -0.5*h[d] || p[d]-bb.hi[d] > 0.5*h[d]) return false;
-  return true;
-}
-
-static bool bh_make_point(BHFastPoint &p,Block *b,const double x[3],int ord,
-                          const var *iv) {
-  p.b=b;
-  for(int d=0;d<3;++d) {
-    if(!b->X[d]) return false;
-    double h=b->getdX(d), x0=b->X[d][0];
-    int cxi=(int)((x[d]-x0)/h+0.4)+1;
-    int cb=cxi-ord/2+1, ct=cb+ord-1, cmin=1, cmax=b->shape[d];
-#ifdef Cell
-    if(d==2 && fabs(x0)<h) cmin=-ord/2+1;
-#else
-    if(d==2 && fabs(x0)<h) cmin=-ord/2+2;
-#endif
-    if(cb<cmin){cb=cmin;ct=cb+ord-1;}
-    if(ct>cmax){ct=cmax;cb=ct+1-ord;}
-    double cx;
-#ifdef Cell
-    if(cb>0) cx=(x[d]-b->X[d][cb-1])/h;
-    else cx=(x[d]+b->X[d][-cb])/h;
-#else
-    if(cb>0) cx=(x[d]-b->X[d][cb-1])/h;
-    else cx=(x[d]+b->X[d][1-cb])/h;
-#endif
-    bh_lagrange(ord,cx,p.w[d]);
-    for(int q=0;q<ord;++q) {
-      int fi=cb+q;
-#ifdef Cell
-      p.idx[d][q]=(fi>0)?fi-1:-fi;
-#else
-      p.idx[d][q]=(fi>0)?fi-1:1-fi;
-#endif
-      if(p.idx[d][q]<0||p.idx[d][q]>=b->shape[d]) return false;
-      if(d==2) p.isign[q]=(fi>0)?1:(iv->SoA[2]<0?-1:1);
-    }
-  }
   return true;
 }
 
@@ -197,8 +141,8 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
     for(int n=0;n<ntot;++n){double x[3]={r*nx[n],r*ny[n],r*nz[n]};Block *own=NULL;
       for(size_t k=0;k<bs.size();++k)if(bh_owns(bs[k],x,h)){own=bs[k].b;break;}
       if(!own)return false;if(own->rank!=rank)continue;
-      BHFastPoint p;p.det=d;p.th=n/nph;p.ph=n-p.th*nph;
-      if(!bh_make_point(p,own,x,c.ord,ip))return false;c.pts.push_back(p);
+      BHFastPoint p;p.b=own;p.det=d;p.th=n/nph;p.ph=n-p.th*nph;
+      p.x[0]=x[0];p.x[1]=x[1];p.x[2]=x[2];c.pts.push_back(p);
     }}
   c.fourier.assign((size_t)c.ndet*nth*c.nm*4,0.0);
   c.local.assign((size_t)c.ndet*c.modes*2,0.0);
@@ -209,21 +153,15 @@ static bool bh_build(BHFastCache &c,int lev,cgh *gh,var *rp,var *ip,
 static void bh_eval(BHFastCache &c,var *rp,var *ip) {
   std::fill(c.fourier.begin(),c.fourier.end(),0.0);
   std::fill(c.local.begin(),c.local.end(),0.0);
-  const int o=c.ord;
   for(size_t z=0;z<c.pts.size();++z){const BHFastPoint &p=c.pts[z];
-    const double *R=p.b->fgfs[rp->sgfn],*I=p.b->fgfs[ip->sgfn];double rr=0,ii=0;
-    int nx=p.b->shape[0],nxy=nx*p.b->shape[1];
-    double yzR[2*ghost_width][2*ghost_width],yzI[2*ghost_width][2*ghost_width];
-    double xR[2*ghost_width],xI[2*ghost_width];
-    for(int i=0;i<o;++i)for(int j=0;j<o;++j){double zr=0,zi=0;
-      int xy=p.idx[0][i]+p.idx[1][j]*nx;
-      for(int k=0;k<o;++k){int at=xy+p.idx[2][k]*nxy;double w=p.w[2][k];
-        zr+=w*R[at];zi+=w*p.isign[k]*I[at];}
-      yzR[i][j]=zr;yzI[i][j]=zi;}
-    for(int i=0;i<o;++i){double yr=0,yi=0;for(int j=0;j<o;++j){
-      yr+=p.w[1][j]*yzR[i][j];yi+=p.w[1][j]*yzI[i][j];}
-      xR[i]=yr;xI[i]=yi;}
-    for(int i=0;i<o;++i){rr+=p.w[0][i]*xR[i];ii+=p.w[0][i]*xI[i];}
+    double rr=0.0,ii=0.0;
+    int sym=1;
+    double xx=p.x[0],yy=p.x[1],zz=p.x[2];
+    f_global_interp(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
+                    p.b->fgfs[rp->sgfn],rr,xx,yy,zz,c.ord,rp->SoA,sym);
+    xx=p.x[0];yy=p.x[1];zz=p.x[2];
+    f_global_interp(p.b->shape,p.b->X[0],p.b->X[1],p.b->X[2],
+                    p.b->fgfs[ip->sgfn],ii,xx,yy,zz,c.ord,ip->SoA,sym);
     size_t tr=(size_t)p.ph*c.nm;
     for(int m=0;m<c.nm;++m){double cs=c.cphi[tr+m],sn=c.sphi[tr+m];
       double *f=&c.fourier[bh_fidx(c,p.det,p.th,m,0)];
