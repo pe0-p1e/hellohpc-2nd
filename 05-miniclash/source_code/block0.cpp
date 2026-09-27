@@ -2,7 +2,7 @@
 #include <vector>
 #include "main.hpp"
 
-uint32 seed32_1, seed32_2;
+thread_local uint32 seed32_1, seed32_2;
 
 namespace {
 const std::vector<uint32> q4mask = [] {
