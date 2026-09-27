@@ -277,11 +277,6 @@ int main(int argc, char** argv)
 	string prefixfn;
 	bool verbose = true;
 
-	cout <<
-		"MD5 collision generator v1.5\n"
-		"by Marc Stevens (http://www.win.tue.nl/hashclash/)\n"
-		<< endl;
-
 	try
 	{
 		hashclash::timer runtime(true);
@@ -428,7 +423,7 @@ int main(int argc, char** argv)
 		uint32 msg1block1[16];
 		uint32 msg2block0[16];
 		uint32 msg2block1[16];
-		find_collision(IV, msg1block0, msg1block1, msg2block0, msg2block1, true);
+		find_collision(IV, msg1block0, msg1block1, msg2block0, msg2block1, verbose);
 
 		save_block(ofs1, msg1block0);
 		save_block(ofs1, msg1block1);
